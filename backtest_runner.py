@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 import logging
-import random # <-- 1. Import random library
+# import random <-- 1. REMOVED
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Callable, List
 from trading_bot import AdvancedAdaptiveGridTradingBot
@@ -100,7 +100,7 @@ class SimulationEngine:
             bot.initialize_state(first_row.to_dict())
 
         # --- HIGH-SPEED CONCURRENT SIMULATION LOOP ---
-        random.seed(42) # <-- 2. Add deterministic seed for shuffling
+        # random.seed(42) # <-- 2. REMOVED: No longer needed as path is deterministic
         for i in range(1, len(df_merged)):
             current_row, prev_row = df_merged.iloc[i], df_merged.iloc[i-1]
             
@@ -113,10 +113,26 @@ class SimulationEngine:
             # Simulate ticks for the current 1m candle
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             
-            # <-- 4. FIX: Implement realistic, shuffled tick simulation
-            hl_ticks = [h, l]
-            random.shuffle(hl_ticks)
-            key_prices = [o, hl_ticks[0], hl_ticks[1], c]
+            # --- START: Deterministic Worst-Case Path Simulation ---
+            #
+            # We determine the "worst path" based on the bar's direction.
+            #
+            # If the bar is bullish (Close > Open):
+            # The most destructive path for stops is Open -> Low -> High -> Close.
+            # This path tries to stop you out at the bottom *before* moving up.
+            #
+            # If the bar is bearish (Close <= Open):
+            # The most destructive path for stops is Open -> High -> Low -> Close.
+            # This path tries to hit your buy entries *before* crashing down.
+            
+            if c > o:
+                # Bullish Bar: Test stops first (O -> L -> H -> C)
+                key_prices = [o, l, h, c]
+            else:
+                # Bearish Bar: Test entries first (O -> H -> L -> C)
+                key_prices = [o, h, l, c]
+            # --- END: Deterministic Worst-Case Path Simulation ---
+            
             
             # <-- 5. FIX: Get all indicator values from the PREVIOUS, CLOSED candle
             # These values are constant for all 4 ticks within the current candle.
