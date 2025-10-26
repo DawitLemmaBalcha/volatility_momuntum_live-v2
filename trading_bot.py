@@ -103,14 +103,25 @@ class AdvancedAdaptiveGridTradingBot:
             if position.stop_loss is not None and ((position.is_long and current_price <= position.stop_loss) or (not position.is_long and current_price >= position.stop_loss)):
                 self.close_position(position, current_price, "Trail Stop" if position.is_trailing_active else "ATR Stop")
 
-    def check_entries_on_tick(self, tick: Tick, rsi_1m: float, macd_1m: float, volume_ma_1m: float, atr: float):
+# --- MODIFY THE SIGNATURE ---
+    def check_entries_on_tick(self, tick: Tick, rsi_1m: float, macd_1m: float, volume_1m: float, volume_ma_1m: float, atr: float):
         for order in self.grid_orders[:]:
             if (order.order_type == "buy" and tick.price >= order.price) or (order.order_type == "sell" and tick.price <= order.price):
-                volume_ok = tick.candle_volume > (volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0))
+                
+                volume_ok = volume_1m > (volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0))
+                
                 if order.order_type == "buy": rsi_ok, macd_ok = rsi_1m > self.config.RSI_BUY_CONFIRMATION, macd_1m > 0
                 else: rsi_ok, macd_ok = rsi_1m < self.config.RSI_SELL_CONFIRMATION, macd_1m < 0
+                
                 if rsi_ok and macd_ok and volume_ok:
-                    details = {"price_ok": f"{tick.price:,.2f} {' >=' if order.order_type == 'buy' else ' <='} {order.price:,.2f}", "rsi_ok": rsi_ok, "rsi_val": rsi_1m, "rsi_req": getattr(self.config, f'RSI_{"BUY" if order.order_type == "buy" else "SELL"}_CONFIRMATION'), "macd_ok": macd_ok, "macd_val": macd_1m, "volume_ok": volume_ok, "volume_val": tick.candle_volume, "volume_req": volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)}
+                    details = {
+                        "price_ok": f"{tick.price:,.2f} {' >=' if order.order_type == 'buy' else ' <='} {order.price:,.2f}", 
+                        "rsi_ok": rsi_ok, "rsi_val": rsi_1m, "rsi_req": getattr(self.config, f'RSI_{"BUY" if order.order_type == "buy" else "SELL"}_CONFIRMATION'), 
+                        "macd_ok": macd_ok, "macd_val": macd_1m, 
+                        "volume_ok": volume_ok, 
+                        "volume_val": volume_1m,
+                        "volume_req": volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
+                    }
                     self.execute_trade(order, details, atr)
                     self.grid_orders.remove(order)
 

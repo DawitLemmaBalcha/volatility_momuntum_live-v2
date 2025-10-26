@@ -123,19 +123,17 @@ class SimulationEngine:
             rsi_1m_val = prev_row['rsi_1m']
             macd_1m_val = prev_row['macd_1m']
             volume_ma_1m_val = prev_row['volume_ma_1m']
+            volume_1m_val = prev_row['volume']
             atr_val = prev_row['atr'] # 30m ATR is already from the past via merge_asof
 
             for price in key_prices:
-                # Note: We use current_row['volume'] for the *total candle volume*
-                # This is still a form of lookahead, but fixing it requires tick data.
-                # The *indicator* lookahead (volume_ma_1m) is fixed, which is the main issue.
-                tick = Tick(timestamp=base_ts, price=price, volume=0, candle_volume=v)
+                # ...
+                tick = Tick(timestamp=base_ts, price=price, volume=0, candle_volume=v) # candle_volume is now ignored by the bot's logic
                 clock.current_time, clock.current_price = tick.timestamp, price
                 
-                # Distribute tick to all bots
                 for bot in self.bots:
-                    # <-- 6. FIX: Pass the 'safe' (previous) indicator values
-                    bot.check_entries_on_tick(tick, rsi_1m_val, macd_1m_val, volume_ma_1m_val, atr_val)
+                    # --- MODIFY THIS CALL ---
+                    bot.check_entries_on_tick(tick, rsi_1m_val, macd_1m_val, volume_1m_val, volume_ma_1m_val, atr_val)
                     bot.check_exits_on_1m(price, atr_val)
 
             # Record portfolio equity at the end of each 1m candle
