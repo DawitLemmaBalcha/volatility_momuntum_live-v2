@@ -1,0 +1,99 @@
+# config.py
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# -- API Credentials --
+API_KEY = os.getenv('BYBIT_API_KEY')
+API_SECRET = os.getenv('BYBIT_API_SECRET')
+
+# -- Data Fetching Parameters --
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '30m'
+START_DATE = '2024-12-01 00:00:00'
+END_DATE = '2025-01-01 00:00:00'
+
+# -- Bot Core Parameters --
+INITIAL_CAPITAL = 50000.0
+MAX_POSITIONS = 10
+
+
+BYBIT_TAKER_FEE = 0.00055
+GRID_SETUP_COOLDOWN_SECONDS = 1800 # 30 minutes
+
+#4 hours 14400
+# -- Optimizable Parameters -----------------
+ATR_INITIAL_STOP_MULTIPLIER = 1.499148030614978
+ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER = 2.695846641462522
+TRAILING_RATIO = 0.1538376736406328
+GRID_BB_WIDTH_MULTIPLIER = 0.1606681055504023
+CONFIRMATION_RSI_PERIOD = 44
+CONFIRMATION_VOLUME_MA_PERIOD = 36
+ATR_TRAILING_STOP_MULTIPLIER = 0.4147227758145075
+
+#----------------------------------------------
+
+NUM_GRIDS = 6
+GRID_MAX_LIFESPAN_SECONDS = 14400  # 3 hours
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD_DEV = 2.0
+
+RSI_BUY_CONFIRMATION = 75
+RSI_SELL_CONFIRMATION = 25
+VOLUME_CONFIRMATION_FACTOR = 2.5
+
+
+# Ratio for a standard, EMA-detected trend
+TREND_GRID_RATIO_NORMAL = 0.6  # 60% of grids in trend direction
+
+# Ratio for a strong, multi-indicator confirmed trend
+TREND_GRID_RATIO_STRONG = 0.8  # 80% of grids in trend direction
+
+
+CONFIRMATION_MACD_FAST_PERIOD = 12
+CONFIRMATION_MACD_SLOW_PERIOD = 26
+CONFIRMATION_MACD_SIGNAL_PERIOD = 9
+
+
+
+MAX_POSITION_DURATION_SECONDS = 86400
+
+
+GRID_VOLATILITY_SCALING_MIN = 0.08
+GRID_VOLATILITY_SCALING_MAX = 2.00
+GRID_MIN_SIZE_PERCENT = 0.0007
+GRID_MAX_SIZE_PERCENT = 0.03
+
+# -- Risk Management & Exits --
+TAKE_PROFIT_PERCENT = 1000.0  # Disabled to rely on trailing stops
+MAX_DRAWDOWN_PERCENT = 20.0
+ATR_PERIOD = 14
+  
+
+# -- Position Sizing Parameters --
+MAX_POSITION_SIZE_PERCENT = 0.5
+KELLY_FRACTION = 1
+KELLY_LOOKBACK = 20
+KELLY_MIN_FRACTION = 0.6
+
+# -- Technical Indicator Parameters --
+RSI_PERIOD = 14
+SHORT_EMA_PERIOD = 10
+LONG_EMA_PERIOD = 20
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+VOLUME_MA_PERIOD = 20
+
+# -- Trend Detection Parameters (for 30m) --
+TREND_EMA_THRESHOLD_PERCENT = 0.2 # How far apart EMAs need to be to declare a trend
+BB_REGIME_THRESHOLD = 0.015       # BB width threshold to define "trending" vs "ranging"
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+
+# -- Backtest Priming Lookback --
+REQUIRED_LOOKBACK = max(MACD_SLOW_PERIOD + MACD_SIGNAL_PERIOD, VOLUME_MA_PERIOD, ATR_PERIOD)
+
+
