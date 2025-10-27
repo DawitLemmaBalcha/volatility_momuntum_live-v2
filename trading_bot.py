@@ -29,6 +29,12 @@ class AdvancedAdaptiveGridTradingBot:
         self.symbol = self.config.SYMBOL
         self.kelly_fraction = self.config.KELLY_FRACTION
         self.max_position_size = self.config.MAX_POSITION_SIZE_PERCENT
+        
+        # --- NEW: Degrading position sizing parameters ---
+        # Load from config, default to 1.0 (no degradation) if not specified
+        self.position_degrading_factor = getattr(self.config, 'POSITION_DEGRADING_FACTOR', 1.0) 
+        self.trades_since_grid_rebuild = 0
+        # --- END NEW ---
 
         self.open_positions, self.grid_orders, self.trade_history = [], [], []
         self.max_drawdown, self.last_grid_setup_time, self.grid_size, self.trend_regime = 0.0, 0, 0.01, "uninitialized"
@@ -65,6 +71,11 @@ class AdvancedAdaptiveGridTradingBot:
         if current_time - self.last_grid_setup_time < self.config.GRID_SETUP_COOLDOWN_SECONDS: return
         current_price = data_row['close']
         self.grid_orders.clear() # Clear before calculating new ones
+        
+        # --- NEW: Reset the trade counter. This implements the "grid set" logic. ---
+        self.trades_since_grid_rebuild = 0
+        # --- END NEW ---
+        
         old_grid_size = self.grid_size
         bb_width = (data_row['bb_upper'] - data_row['bb_lower']) / current_price if current_price > 0 else 0
         self.grid_size = max(self.config.GRID_MIN_SIZE_PERCENT, min(bb_width * getattr(self.config, 'GRID_BB_WIDTH_MULTIPLIER', 0.5), self.config.GRID_MAX_SIZE_PERCENT))
@@ -80,23 +91,21 @@ class AdvancedAdaptiveGridTradingBot:
         new_grid_orders = [] # Build temporary list first for logging
         for i in range(1, upper_grids + 1):
             price = current_price * (1 + i * self.grid_size)
-            # --- MODIFIED: Calculate size AND get details for logging ---
-            size, size_details_str = self.calculate_position_size(price, return_details=True)
-            new_order = Order(price, size, "buy")
+            # --- MODIFIED: Size calculation removed ---
+            new_order = Order(price, "buy")
             new_grid_orders.append(new_order)
             if not self.silent:
-                default_logger.info(f"{current_time_str} - Created internal grid order: buy {new_order.amount:.5f} @ stop {new_order.price:,.2f}")
-                default_logger.info(f"{current_time_str} - {size_details_str}")
+                # --- MODIFIED: Simplified log ---
+                default_logger.info(f"{current_time_str} - Created internal grid level: buy @ stop {new_order.price:,.2f}")
             # --- END MODIFIED ---
         for i in range(1, lower_grids + 1):
             price = current_price * (1 - i * self.grid_size)
-            # --- MODIFIED: Calculate size AND get details for logging ---
-            size, size_details_str = self.calculate_position_size(price, return_details=True)
-            new_order = Order(price, size, "sell")
+            # --- MODIFIED: Size calculation removed ---
+            new_order = Order(price, "sell")
             new_grid_orders.append(new_order)
             if not self.silent:
-                default_logger.info(f"{current_time_str} - Created internal grid order: sell {new_order.amount:.5f} @ stop {new_order.price:,.2f}")
-                default_logger.info(f"{current_time_str} - {size_details_str}")
+                # --- MODIFIED: Simplified log ---
+                default_logger.info(f"{current_time_str} - Created internal grid level: sell @ stop {new_order.price:,.2f}")
             # --- END MODIFIED ---
 
         self.grid_orders = new_grid_orders # Assign the fully built list
@@ -177,8 +186,15 @@ class AdvancedAdaptiveGridTradingBot:
 
                 if rsi_ok and macd_ok and volume_ok:
                     # --- NEW: Add Timestamp to Trigger Log ---
-                    if not self.silent: default_logger.info(f"{format_time(tick.timestamp)} - Grid order triggered: {order.order_type} {order.amount:.5f} @ {order.price:,.2f} by tick price {tick.price:,.2f}")
+                    if not self.silent: default_logger.info(f"{format_time(tick.timestamp)} - Grid level triggered: {order.order_type} @ {order.price:,.2f} by tick price {tick.price:,.2f}")
                     # --- END NEW ---
+                    
+                    # --- MODIFIED: Calculate size "Just-in-Time" ---
+                    size, size_details_str = self.calculate_position_size(tick.price, return_details=True)
+                    if not self.silent:
+                        default_logger.info(f"{format_time(tick.timestamp)} - {size_details_str}")
+                    # --- END MODIFIED ---
+                    
                     details = {
                         "price_ok": f"{tick.price:,.2f} {' >=' if order.order_type == 'buy' else ' <='} {order.price:,.2f}",
                         "rsi_ok": rsi_ok, "rsi_val": rsi_1m, "rsi_req": getattr(self.config, f'RSI_{"BUY" if order.order_type == "buy" else "SELL"}_CONFIRMATION'),
@@ -187,28 +203,44 @@ class AdvancedAdaptiveGridTradingBot:
                         "volume_val": volume_1m,
                         "volume_req": volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
                     }
-                    self.execute_trade(order, details, atr)
+                    
+                    # --- MODIFIED: Pass the calculated size to execute_trade ---
+                    self.execute_trade(order, size, details, atr)
                     self.grid_orders.remove(order) # Remove after execution attempt
 
-    def execute_trade(self, order: Order, confirmation_details: dict, atr: float):
+    # --- MODIFIED: Signature changed to accept 'amount' ---
+    def execute_trade(self, order: Order, amount: float, confirmation_details: dict, atr: float):
         current_time_str = format_time(self.clock.time()) # Get formatted time
-        if len(self.open_positions) >= self.config.MAX_POSITIONS or order.amount <= 0: return
+        
+        # --- MODIFIED: Check the passed 'amount' ---
+        if len(self.open_positions) >= self.config.MAX_POSITIONS or amount <= 0: 
+            if amount <= 0 and not self.silent:
+                default_logger.info(f"{current_time_str} - Skipping trade. Calculated size is {amount:.5f}.")
+            return
+        # --- END MODIFIED ---
+        
         direction = 'LONG' if order.order_type == 'buy' else 'SHORT'
 
         # --- Log attempt ---
-        if not self.silent: default_logger.info(f"{current_time_str} - Attempting to place order via connector: {order.order_type} {order.amount:.5f} {self.symbol}")
+        # --- MODIFIED: Use 'amount' in log ---
+        if not self.silent: default_logger.info(f"{current_time_str} - Attempting to place order via connector: {order.order_type} {amount:.5f} {self.symbol}")
 
-        result = self.connector.place_order(symbol=self.symbol, side=order.order_type, order_type="Market", qty=order.amount, price=order.price)
+        # --- MODIFIED: Use 'amount' in connector call ---
+        result = self.connector.place_order(symbol=self.symbol, side=order.order_type, order_type="Market", qty=amount, price=order.price)
         if not result or not result.get("success"):
             if not self.silent: default_logger.error(f"{current_time_str} - Connector failed to place order.")
             return
 
         # --- NEW: Increment Grid Traded Counter ---
         self.total_grids_traded += 1
+        
+        # --- NEW: Increment "trades since rebuild" counter ---
+        self.trades_since_grid_rebuild += 1
         # --- END NEW ---
 
         entry_price = result['entry_price']
-        new_position = Position(entry_price, order.amount, direction == 'LONG')
+        # --- MODIFIED: Use 'amount' to create Position ---
+        new_position = Position(entry_price, amount, direction == 'LONG')
         new_position.id, new_position.entry_time, new_position.entry_regime = result['trade_id'], self.clock.time(), self.trend_regime # Use precise clock time for entry
         stop_distance = atr * self.config.ATR_INITIAL_STOP_MULTIPLIER if (atr > 0 and pd.notna(atr)) else entry_price * 0.01 # Fallback stop distance
         new_position.kelly_risk_usd, new_position.atr_risk_usd = entry_price * new_position.amount, stop_distance * new_position.amount
@@ -261,10 +293,22 @@ class AdvancedAdaptiveGridTradingBot:
             details_str = "Pos Size Calc: Price <= 0, returning 0.0"
             return (0.0, details_str) if return_details else 0.0
 
-        unrealized_pnl = sum(pos.calculate_profit(self.clock.current_price) for pos in self.open_positions) if self.clock.current_price > 0 else 0
-        effective_capital = min(self.capital + unrealized_pnl, self.peak_capital)
-        # Prevent negative effective capital
-        effective_capital = max(0.0, effective_capital)
+        # --- MODIFIED: New Effective Capital Calculation ---
+        unrealized_pnl = 0.0
+        if self.clock.current_price > 0:
+            for pos in self.open_positions:
+                pnl = pos.calculate_profit(self.clock.current_price)
+                if pnl < 0: # Only sum unrealized losses
+                    unrealized_pnl += pnl
+        
+        # Base capital is realized capital + paper losses
+        effective_capital_base = self.capital + unrealized_pnl
+        
+        # Effective capital is the minimum of the "marked-to-loss" capital and the all-time peak
+        effective_capital = min(effective_capital_base, self.peak_capital)
+        effective_capital = max(0.0, effective_capital) # Ensure it's not negative
+        # --- END MODIFIED ---
+
 
         # Calculate max value based on percentage limits
         max_value_limit = effective_capital * self.max_position_size
@@ -276,12 +320,28 @@ class AdvancedAdaptiveGridTradingBot:
         final_pos_value = min(effective_capital * self.max_position_size, effective_capital * self.kelly_fraction)
 
 
-        final_amount = final_pos_value / price if price > 0 else 0.0
+        # --- NEW: Apply Degrading Sizing Logic ---
+        base_amount = final_pos_value / price if price > 0 else 0.0
+        
+        # Get the number of trades already open *in this grid set*
+        # This counter is reset to 0 every time the grid is rebuilt
+        trade_count_in_set = self.trades_since_grid_rebuild 
+        
+        # Apply the degrading factor (e.g., 1.0^0, 0.75^1, 0.75^2, ...)
+        degrading_multiplier = pow(self.position_degrading_factor, trade_count_in_set)
+        
+        final_amount = base_amount * degrading_multiplier
+        # --- END NEW ---
+        
 
-        details_str = (f"Pos Size Calc: EffCapital={effective_capital:,.2f}, "
-                       f"MaxPosVal={max_value_limit:,.2f}, KellyPosVal={kelly_value:,.2f} "
+        # --- MODIFIED: Updated details string ---
+        details_str = (f"Pos Size Calc: RealizedCap={self.capital:,.2f}, UPLosses={unrealized_pnl:,.2f} -> "
+                       f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> "
+                       f"EffCapital={effective_capital:,.2f}, MaxPosVal={max_value_limit:,.2f}, KellyPosVal={kelly_value:,.2f} "
                        f"(MaxSz={self.max_position_size:.3f}, KellyFrac={self.kelly_fraction:.3f}) "
-                       f"-> FinalVal={final_pos_value:,.2f} -> Amount={final_amount:.5f}")
+                       f"-> FinalVal={final_pos_value:,.2f} -> BaseAmount={base_amount:.5f}\n"
+                       f"             -> Degrading: Factor={self.position_degrading_factor}, TradeCountInSet={trade_count_in_set} -> Multiplier={degrading_multiplier:.4f}\n"
+                       f"             -> Final Amount={final_amount:.5f}")
 
         return (final_amount, details_str) if return_details else final_amount
     # --- END MODIFIED ---

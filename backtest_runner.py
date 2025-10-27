@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 import logging
-# import random <-- 1. REMOVED
+# import random <-- 1. REMOVED (Original file)
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Callable, List
 from trading_bot import AdvancedAdaptiveGridTradingBot
@@ -100,31 +100,21 @@ class SimulationEngine:
             bot.initialize_state(first_row.to_dict())
 
         # --- HIGH-SPEED CONCURRENT SIMULATION LOOP ---
-        # random.seed(42) # <-- 2. REMOVED: No longer needed as path is deterministic
+        # random.seed(42) # <-- 2. REMOVED (Original file)
         for i in range(1, len(df_merged)):
             current_row, prev_row = df_merged.iloc[i], df_merged.iloc[i-1]
             
             # Update 30-minute strategies
             if current_row['timestamp'].floor('30min') > prev_row['timestamp'].floor('30min'):
                 for bot in self.bots:
-                    # <-- 3. FIX: Use PREVIOUS row for 30m strategy decisions
+                    # <-- 3. FIX: Use PREVIOUS row for 30m strategy decisions (Original file)
                     bot.update_strategy_on_30m(prev_row.to_dict())
             
             # Simulate ticks for the current 1m candle
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             
             # --- START: Deterministic Worst-Case Path Simulation ---
-            #
-            # We determine the "worst path" based on the bar's direction.
-            #
-            # If the bar is bullish (Close > Open):
-            # The most destructive path for stops is Open -> Low -> High -> Close.
-            # This path tries to stop you out at the bottom *before* moving up.
-            #
-            # If the bar is bearish (Close <= Open):
-            # The most destructive path for stops is Open -> High -> Low -> Close.
-            # This path tries to hit your buy entries *before* crashing down.
-            
+            # (Original file logic)
             if c > o:
                 # Bullish Bar: Test stops first (O -> L -> H -> C)
                 key_prices = [o, l, h, c]
@@ -136,11 +126,19 @@ class SimulationEngine:
             
             # <-- 5. FIX: Get all indicator values from the PREVIOUS, CLOSED candle
             # These values are constant for all 4 ticks within the current candle.
-            rsi_1m_val = prev_row['rsi_1m']
-            macd_1m_val = prev_row['macd_1m']
-            volume_ma_1m_val = prev_row['volume_ma_1m']
-            volume_1m_val = prev_row['volume']
-            atr_val = prev_row['atr'] # 30m ATR is already from the past via merge_asof
+            
+            # --- START OF FIX ---
+            # Read from 'current_row' because 'shift(1)' in _prepare_data
+            # already made these values point-in-time correct (i.e., from t-1).
+            rsi_1m_val = current_row['rsi_1m']
+            macd_1m_val = current_row['macd_1m']
+            volume_ma_1m_val = current_row['volume_ma_1m']
+            atr_val = current_row['atr'] # 30m ATR is already from the past via merge_asof
+
+            # This one remains 'prev_row' as it's the volume of the *last completed bar*.
+            volume_1m_val = prev_row['volume'] 
+            # --- END OF FIX ---
+
 
             for price in key_prices:
                 # ...
