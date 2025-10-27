@@ -58,8 +58,8 @@ def objective(trial, df_1m_full: pd.DataFrame, opt_logger):
         trial_config.ATR_INITIAL_STOP_MULTIPLIER = initial_stop_multiplier
         trial_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER = activation_multiplier
         trial_config.ATR_TRAILING_STOP_MULTIPLIER = activation_multiplier * trailing_ratio
-        trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", 25, 35)
-        trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 25, 35)
+        trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", 15, 30)
+        trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 15, 30)
 
         performance_metrics = run_single_backtest(df_1m_full, trial_config, verbose=False)
 

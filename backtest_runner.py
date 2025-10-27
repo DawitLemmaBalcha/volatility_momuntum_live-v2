@@ -12,7 +12,7 @@ from core_types import SimulationClock, Tick, Position
 
 # DummyConnector remains a private helper class
 class DummyConnector(ABC):
-    SLIPPAGE_PERCENT = 0.0005
+    SLIPPAGE_PERCENT = 0.001
     def __init__(self, clock: SimulationClock, params: dict):
         self.clock, self.params, self._trade_id_counter = clock, params, 0
     def connect(self): pass
