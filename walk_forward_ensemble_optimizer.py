@@ -7,20 +7,26 @@ import pandas as pd
 import optuna
 import json
 
+# --- NEW: Add imports for clustering ---
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+# --- END NEW ---
+
 # Import necessary components from your existing project files
 import config
 from data_fetcher import fetch_all_dataframes
 from optimize import ConfigContainer  # We need the container for building bots
 from trading_bot import AdvancedAdaptiveGridTradingBot
-from backtest_runner import SimulationEngine # The core engine for OOS testing
+from backtest_runner import SimulationEngine, run_single_backtest
 
 # --- Global list to store results from all walks ---
 all_walks_data = []
 
-# --- Helper function to create a specialized objective ---
-def create_objective_function(parameter_range: dict):
+# --- MODIFIED: Helper function to create a *single* wide objective ---
+def create_wide_objective_function():
     """
-    Creates a tailored objective function for Optuna based on a defined parameter range.
+    Creates a tailored objective function for Optuna with wide parameter ranges
+    to allow the optimizer to explore a large landscape.
     """
     def objective(trial, df_1m_full: pd.DataFrame, opt_logger):
         try:
@@ -29,40 +35,44 @@ def create_objective_function(parameter_range: dict):
                 if attr.isupper():
                     setattr(trial_config, attr, getattr(config, attr))
 
-            # Use the specific parameter range for this objective
-            initial_stop_multiplier = trial.suggest_float("ATR_INITIAL_STOP_MULTIPLIER", 0.5, 1.5)
-            activation_multiplier = trial.suggest_float("ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER", low=initial_stop_multiplier, high=initial_stop_multiplier * 2.0)
+            # --- MODIFIED: Use wide parameter ranges ---
+            initial_stop_multiplier = trial.suggest_float("ATR_INITIAL_STOP_MULTIPLIER", 0.5, 2.0)
+            activation_multiplier = trial.suggest_float("ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER", low=initial_stop_multiplier, high=initial_stop_multiplier * 4.0)
             trailing_ratio = trial.suggest_float("TRAILING_RATIO", 0.1, 0.9)
             
-            trial_config.GRID_BB_WIDTH_MULTIPLIER = trial.suggest_float("GRID_BB_WIDTH_MULTIPLIER", 0.05, 0.2)
+            trial_config.GRID_BB_WIDTH_MULTIPLIER = trial.suggest_float("GRID_BB_WIDTH_MULTIPLIER", 0.03, 0.3)
             trial_config.ATR_INITIAL_STOP_MULTIPLIER = initial_stop_multiplier
             trial_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER = activation_multiplier
             trial_config.ATR_TRAILING_STOP_MULTIPLIER = activation_multiplier * trailing_ratio
 
-            # *** The key difference is here ***
-            trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", parameter_range["rsi_min"], parameter_range["rsi_max"])
-            trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", parameter_range["vol_min"], parameter_range["vol_max"])
+            trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", 15, 50)
+            trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 15, 50)
+            # --- END MODIFIED ---
 
-            # This requires a small change in backtest_runner to accept a simple config object
-            from backtest_runner import run_single_backtest
             performance_metrics = run_single_backtest(df_1m_full, trial_config, verbose=False)
 
             if not performance_metrics: return -1.0
             
+            # Save all performance metrics, we need 'total_trades' for filtering
             trial.set_user_attr("performance", performance_metrics)
             return performance_metrics.get("sortino_ratio", -1.0)
+        
         except Exception as e:
             opt_logger.error(f"TRIAL FAILED: {e}", exc_info=False) # Keep logs cleaner
             return -1.0
     return objective
+# --- END MODIFIED ---
 
-def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, n_trials: int, opt_logger):
+
+# --- MODIFIED: Main walk function to use K-Means ---
+def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, n_trials: int, n_ensemble_bots: int, opt_logger):
     """
-    Executes a full walk-forward cycle with dual optimization and ensemble OOS testing.
+    Executes a full walk-forward cycle with a single wide optimization
+    and K-Means clustering for diverse ensemble selection.
     """
     opt_logger.info(f"--- Starting Walk #{walk_number} | IS: {is_start} to {is_end} | OOS: {is_end} to {oos_end} ---")
 
-    # 1. --- Fetch and slice data ---
+    # 1. --- Fetch and slice data --- (No changes here)
     config.START_DATE, config.END_DATE = is_start, oos_end
     try:
         _, df_full, _ = fetch_all_dataframes()
@@ -75,44 +85,71 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         opt_logger.error(f"Failed to fetch or slice data: {e}", exc_info=True)
         return
 
-    # 2. --- Run Dual Optimizations ---
+    # 2. --- Run ONE Single, Wide Optimization ---
     optuna.logging.set_verbosity(optuna.logging.ERROR)
     
-    # Aggressive Optimization
-    opt_logger.info(f"--- Running AGGRESSIVE optimization ({n_trials} trials)... ---")
-    aggressive_params = {"rsi_min": 25, "rsi_max": 35, "vol_min": 25, "vol_max": 35}
-    study_aggressive = optuna.create_study(direction="maximize")
-    study_aggressive.optimize(lambda trial: create_objective_function(aggressive_params)(trial, df_is, opt_logger), n_trials=n_trials, n_jobs=-1)
+    opt_logger.info(f"--- Running WIDE optimization ({n_trials} trials)... ---")
+    objective_func = create_wide_objective_function()
+    study = optuna.create_study(direction="maximize")
+    study.optimize(lambda trial: objective_func(trial, df_is, opt_logger), n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
 
-    # Conservative Optimization
-    opt_logger.info(f"--- Running CONSERVATIVE optimization ({n_trials} trials)... ---")
-    conservative_params = {"rsi_min": 35, "rsi_max": 45, "vol_min": 35, "vol_max": 45}
-    study_conservative = optuna.create_study(direction="maximize")
-    study_conservative.optimize(lambda trial: create_objective_function(conservative_params)(trial, df_is, opt_logger), n_trials=n_trials, n_jobs=-1)
-
-    # 3. --- Select Top Performers (Ranks 2-5) ---
-    def select_top_bots(study, study_name):
-        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value > -1.0]
-        if len(completed) < 5:
-            opt_logger.warning(f"Not enough successful trials in {study_name} study to select top 4 (found {len(completed)}).")
-            return []
-        sorted_trials = sorted(completed, key=lambda t: t.value, reverse=True)
-        return sorted_trials[1:5] # Ranks 2, 3, 4, 5
-
-    top_aggressive = select_top_bots(study_aggressive, "Aggressive")
-    top_conservative = select_top_bots(study_conservative, "Conservative")
+    # 3. --- NEW: Filter, Cluster, and Select Top Performers ---
     
-    if not top_aggressive and not top_conservative:
-        opt_logger.error("No successful trials in either study. Cannot run OOS test.")
+    # 3a. Filter: Get all high-quality, completed trials
+    completed_trials = []
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None:
+            perf = t.user_attrs.get("performance", {})
+            sortino = perf.get("sortino_ratio", -1.0)
+            total_trades = perf.get("total_trades", 0)
+            
+            # --- Quality Filter ---
+            if sortino > 0.5 and total_trades > 20:
+                completed_trials.append(t)
+
+    opt_logger.info(f"Optimization complete. Found {len(completed_trials)} high-quality trials (Sortino > 0.5, Trades > 20).")
+
+    if len(completed_trials) < n_ensemble_bots:
+        opt_logger.warning(f"Found only {len(completed_trials)} trials, which is less than the desired ensemble size of {n_ensemble_bots}. Using all found trials.")
+        ensemble_bots_trials = completed_trials
+    else:
+        # 3b. Cluster: Prepare data and run K-Means
+        data_for_clustering = []
+        for trial in completed_trials:
+            row = trial.params.copy()
+            row['sortino'] = trial.value
+            row['trial_object'] = trial  # Keep a reference to the trial
+            data_for_clustering.append(row)
+        
+        df = pd.DataFrame(data_for_clustering)
+        param_cols = [col for col in df.columns if col not in ['sortino', 'trial_object']]
+        
+        # Normalize parameters for stable clustering
+        scaler = StandardScaler()
+        df_scaled = scaler.fit_transform(df[param_cols])
+
+        kmeans = KMeans(n_clusters=n_ensemble_bots, random_state=42, n_init=10)
+        df['cluster'] = kmeans.fit_predict(df_scaled)
+        
+        opt_logger.info(f"Clustering complete. Grouped trials into {n_ensemble_bots} clusters.")
+
+        # 3c. Select: Get the best trial (by Sortino) from each cluster
+        best_trials_from_clusters = df.loc[df.groupby('cluster')['sortino'].idxmax()]
+        ensemble_bots_trials = best_trials_from_clusters['trial_object'].tolist()
+    
+    # --- END NEW ---
+
+    if not ensemble_bots_trials:
+        opt_logger.error("No successful trials were selected. Cannot run OOS test.")
         return
 
-    opt_logger.info(f"Selected {len(top_aggressive)} aggressive and {len(top_conservative)} conservative bots for OOS ensemble.")
+    opt_logger.info(f"Selected {len(ensemble_bots_trials)} diverse bots for OOS ensemble.")
 
-    # 4. --- Run Out-of-Sample Ensemble Backtest ---
+    # 4. --- Run Out-of-Sample Ensemble Backtest --- (No changes here)
     ensemble_bots = []
     
     # Create bot configurations from selected trials
-    for trial in top_aggressive + top_conservative:
+    for trial in ensemble_bots_trials:
         bot_config = ConfigContainer()
         for attr in dir(config):
             if attr.isupper():
@@ -141,7 +178,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         opt_logger.error("Ensemble backtest failed to produce results.")
         return
         
-    # 5. --- Log and Save Results ---
+    # 5. --- Log and Save Results --- (No changes here)
     opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE | WALK #{walk_number} " + "="*25)
     opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
     opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
@@ -152,6 +189,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
 
     portfolio_results['walk'] = walk_number
     all_walks_data.append(portfolio_results)
+# --- END MODIFIED ---
 
 
 if __name__ == "__main__":
@@ -180,9 +218,13 @@ if __name__ == "__main__":
         {'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
     ]
     
-    trials_per_optimization = 50 # 50 for aggressive, 50 for conservative
+    # --- MODIFIED: Set ONE high trial count and a cluster count ---
+    # We run ONE study per walk, so n_trials should be high.
+    trials_per_optimization_walk = 50 # <-- Run a large number of trials
+    number_of_bots_to_cluster = 4    # <-- Select 8 diverse bots
+    # --- END MODIFIED ---
 
-    main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis ---")
+    main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (with K-Means Clustering) ---")
     for i, walk_dates in enumerate(walk_forward_schedule):
         walk_num = i + 1
         run_ensemble_walk(
@@ -190,7 +232,8 @@ if __name__ == "__main__":
             is_start=walk_dates['is_start'],
             is_end=walk_dates['is_end'],
             oos_end=walk_dates['oos_end'],
-            n_trials=trials_per_optimization,
+            n_trials=trials_per_optimization_walk,         # <-- Use new variable
+            n_ensemble_bots=number_of_bots_to_cluster,  # <-- Use new variable
             opt_logger=main_logger
         )
     main_logger.info("\n--- All Walk-Forward Ensemble Analysis runs are complete. ---")

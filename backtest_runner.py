@@ -57,10 +57,48 @@ class SimulationEngine:
         df_30m['atr'] = ta.atr(df_30m['high'], df_30m['low'], df_30m['close'], length=bot_config.ATR_PERIOD)
         macd_30m = ta.macd(df_30m['close'], fast=bot_config.MACD_FAST_PERIOD, slow=bot_config.MACD_SLOW_PERIOD, signal=bot_config.MACD_SIGNAL_PERIOD)
         df_30m['macd'] = macd_30m[f'MACD_{bot_config.MACD_FAST_PERIOD}_{bot_config.MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}']
-        bbands_30m = ta.bbands(df_30m['close'], length=bot_config.BOLLINGER_PERIOD, std=bot_config.BOLLINGER_STD_DEV)
-        df_30m['bb_lower'] = bbands_30m[f'BBL_{bot_config.BOLLINGER_PERIOD}_{bot_config.BOLLINGER_STD_DEV}']
-        df_30m['bb_upper'] = bbands_30m[f'BBU_{bot_config.BOLLINGER_PERIOD}_{bot_config.BOLLINGER_STD_DEV}']
+
+        # --- ROBUST FIX: Handle pandas_ta bbands column naming conventions ---
+        bb_period = bot_config.BOLLINGER_PERIOD
+        bb_std = bot_config.BOLLINGER_STD_DEV
         
+        bbands_30m = ta.bbands(df_30m['close'], length=bb_period, std=bb_std)
+
+        # pandas-ta has inconsistent naming. We must find the column.
+        bbl_col_name = None
+        bbu_col_name = None
+
+        # 1. Try common patterns first
+        patterns_to_try = [
+            f'BBL_{bb_period}_{bb_std}',      # e.g., 'BBL_20_2.0'
+            f'BBL_{bb_period}_{int(bb_std)}',  # e.g., 'BBL_20_2'
+            f'BBL_{bb_period}'              # e.g., 'BBL_20' (if std is default)
+        ]
+        
+        for pattern in patterns_to_try:
+            if pattern in bbands_30m.columns:
+                bbl_col_name = pattern
+                bbu_col_name = pattern.replace('BBL', 'BBU') # Assumes BBU follows the same pattern
+                break
+        
+        # 2. If no pattern matched, find the first column that starts with 'BBL_'
+        if bbl_col_name is None:
+            try:
+                bbl_col_name = [col for col in bbands_30m.columns if col.startswith('BBL_')][0]
+                # Find corresponding BBU
+                bbu_suffix = bbl_col_name[4:] # Get the suffix (e.g., '_20_2.0')
+                bbu_col_name = f'BBU{bbu_suffix}'
+                if bbu_col_name not in bbands_30m.columns:
+                    # Fallback for BBU
+                    bbu_col_name = [col for col in bbands_30m.columns if col.startswith('BBU_')][0]
+            except IndexError:
+                # If we still can't find it, raise a helpful error
+                raise KeyError(f"Could not find Bollinger Bands columns in {bbands_30m.columns}. Looked for patterns like 'BBL_20_2.0', 'BBL_20_2', 'BBL_20', etc.")
+
+        df_30m['bb_lower'] = bbands_30m[bbl_col_name]
+        df_30m['bb_upper'] = bbands_30m[bbu_col_name]
+        # --- END ROBUST FIX ---
+
         df_1m = self.df_1m_full.copy()
         # --- FIX: Shift all 1m indicators to prevent lookahead ---
         # We use shift(1) so that the data for a given row (e.g., 10:01) is based

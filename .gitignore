@@ -5,3 +5,4 @@ data/
 *.parquet
 *.pyc
 /connectors/__pycache__/
+vtwo/
