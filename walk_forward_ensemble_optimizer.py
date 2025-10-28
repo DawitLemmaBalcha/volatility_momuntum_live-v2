@@ -17,7 +17,14 @@ import config
 from data_fetcher import fetch_all_dataframes
 from optimize import ConfigContainer  # We need the container for building bots
 from trading_bot import AdvancedAdaptiveGridTradingBot
-from backtest_runner import SimulationEngine, run_single_backtest
+
+# --- MODIFIED: Import new simulation functions ---
+from backtest_runner import (
+    SimulationEngine, 
+    prepare_data_for_simulation, 
+    run_simulation_from_prepared_data
+)
+# --- END MODIFIED ---
 
 # --- Global list to store results from all walks ---
 all_walks_data = []
@@ -28,7 +35,8 @@ def create_wide_objective_function():
     Creates a tailored objective function for Optuna with wide parameter ranges
     to allow the optimizer to explore a large landscape.
     """
-    def objective(trial, df_1m_full: pd.DataFrame, opt_logger):
+    # --- MODIFIED: Accepts pre-prepared DataFrame ---
+    def objective(trial, df_prepared: pd.DataFrame, opt_logger):
         try:
             trial_config = ConfigContainer()
             for attr in dir(config):
@@ -49,13 +57,26 @@ def create_wide_objective_function():
             trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 15, 50)
             # --- END MODIFIED ---
 
-            performance_metrics = run_single_backtest(df_1m_full, trial_config, verbose=False)
+            # --- MODIFIED: Call the fast simulation runner ---
+            performance_metrics = run_simulation_from_prepared_data(
+                df_prepared, 
+                trial_config, 
+                verbose=False, 
+                logger=opt_logger,
+                trial=trial # <-- PASS TRIAL FOR PRUNING
+            )
 
             if not performance_metrics: return -1.0
             
             # Save all performance metrics, we need 'total_trades' for filtering
             trial.set_user_attr("performance", performance_metrics)
             return performance_metrics.get("sortino_ratio", -1.0)
+        
+        # --- NEW: Catch pruning exception ---
+        except optuna.TrialPruned:
+            opt_logger.info(f"--- Trial {trial.number} Pruned ---")
+            return -1.0
+        # --- END NEW ---
         
         except Exception as e:
             opt_logger.error(f"TRIAL FAILED: {e}", exc_info=False) # Keep logs cleaner
@@ -72,7 +93,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     """
     opt_logger.info(f"--- Starting Walk #{walk_number} | IS: {is_start} to {is_end} | OOS: {is_end} to {oos_end} ---")
 
-    # 1. --- Fetch and slice data --- (No changes here)
+    # 1. --- Fetch and slice data ---
     config.START_DATE, config.END_DATE = is_start, oos_end
     try:
         _, df_full, _ = fetch_all_dataframes()
@@ -81,6 +102,19 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         if df_is.empty or df_oos.empty:
             opt_logger.warning("Skipping walk due to empty in-sample or out-of-sample data.")
             return
+            
+        # --- NEW: Prepare data ONCE for IS and OOS ---
+        opt_logger.info(f"Preparing {len(df_is)} IS records...")
+        df_is_prepared = prepare_data_for_simulation(df_is, config)
+        
+        opt_logger.info(f"Preparing {len(df_oos)} OOS records...")
+        df_oos_prepared = prepare_data_for_simulation(df_oos, config)
+        
+        if df_is_prepared.empty or df_oos_prepared.empty:
+            opt_logger.warning("Skipping walk due to empty prepared data (IS or OOS).")
+            return
+        # --- END NEW ---
+            
     except Exception as e:
         opt_logger.error(f"Failed to fetch or slice data: {e}", exc_info=True)
         return
@@ -91,7 +125,16 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     opt_logger.info(f"--- Running WIDE optimization ({n_trials} trials)... ---")
     objective_func = create_wide_objective_function()
     study = optuna.create_study(direction="maximize")
-    study.optimize(lambda trial: objective_func(trial, df_is, opt_logger), n_trials=n_trials, n_jobs=-1, show_progress_bar=True)
+    
+    # --- MODIFIED: Pass prepared IS data to objective ---
+    study.optimize(
+        lambda trial: objective_func(trial, df_is_prepared, opt_logger), # <-- Use df_is_prepared
+        n_trials=n_trials, 
+        n_jobs=-1, 
+        show_progress_bar=True
+    )
+    # --- END MODIFIED ---
+
 
     # 3. --- NEW: Filter, Cluster, and Select Top Performers ---
     
@@ -169,10 +212,16 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         )
         ensemble_bots.append(bot)
 
-    # Run the concurrent simulation
+    # --- MODIFIED: Run the concurrent simulation using PREPARED OOS data ---
     opt_logger.info(f"--- Running OOS ENSEMBLE backtest with {len(ensemble_bots)} bots... ---")
-    engine = SimulationEngine(df_oos, ensemble_bots, opt_logger)
+    engine = SimulationEngine(
+        df_oos_prepared,  # <-- Pass prepared OOS data
+        ensemble_bots, 
+        opt_logger, 
+        prepared=True     # <-- Set prepared flag to True
+    )
     portfolio_results, _ = engine.run()
+    # --- END MODIFIED ---
     
     if not portfolio_results:
         opt_logger.error("Ensemble backtest failed to produce results.")
@@ -208,11 +257,11 @@ if __name__ == "__main__":
 
     walk_forward_schedule = [
         #{'is_start': '2024-09-01 00:00:00', 'is_end': '2024-12-01 00:00:00', 'oos_end': '2025-01-01 00:00:00'},
-        {'is_start': '2024-10-01 00:00:00', 'is_end': '2025-01-01 00:00:00', 'oos_end': '2025-02-01 00:00:00'},
-        {'is_start': '2024-11-01 00:00:00', 'is_end': '2025-02-01 00:00:00', 'oos_end': '2025-03-01 00:00:00'},
-        {'is_start': '2024-12-01 00:00:00', 'is_end': '2025-03-01 00:00:00', 'oos_end': '2025-04-01 00:00:00'},
-        {'is_start': '2025-01-01 00:00:00', 'is_end': '2025-04-01 00:00:00', 'oos_end': '2025-05-01 00:00:00'},
-        {'is_start': '2025-02-01 00:00:00', 'is_end': '2025-05-01 00:00:00', 'oos_end': '2025-06-01 00:00:00'},
+        #{'is_start': '2024-10-01 00:00:00', 'is_end': '2025-01-01 00:00:00', 'oos_end': '2025-02-01 00:00:00'},
+        #{'is_start': '2024-11-01 00:00:00', 'is_end': '2025-02-01 00:00:00', 'oos_end': '2025-03-01 00:00:00'},
+        #{'is_start': '2024-12-01 00:00:00', 'is_end': '2025-03-01 00:00:00', 'oos_end': '2025-04-01 00:00:00'},
+        #{'is_start': '2025-01-01 00:00:00', 'is_end': '2025-04-01 00:00:00', 'oos_end': '2025-05-01 00:00:00'},
+        #{'is_start': '2025-02-01 00:00:00', 'is_end': '2025-05-01 00:00:00', 'oos_end': '2025-06-01 00:00:00'},
         {'is_start': '2025-03-01 00:00:00', 'is_end': '2025-06-01 00:00:00', 'oos_end': '2025-07-01 00:00:00'},
         {'is_start': '2025-04-01 00:00:00', 'is_end': '2025-07-01 00:00:00', 'oos_end': '2025-08-01 00:00:00'},
         {'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
@@ -220,8 +269,8 @@ if __name__ == "__main__":
     
     # --- MODIFIED: Set ONE high trial count and a cluster count ---
     # We run ONE study per walk, so n_trials should be high.
-    trials_per_optimization_walk = 50 # <-- Run a large number of trials
-    number_of_bots_to_cluster = 4    # <-- Select 8 diverse bots
+    trials_per_optimization_walk = 200 # <-- Run a large number of trials
+    number_of_bots_to_cluster = 8    # <-- Select 8 diverse bots
     # --- END MODIFIED ---
 
     main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (with K-Means Clustering) ---")

@@ -6,9 +6,10 @@ import pandas_ta as ta
 import logging
 # import random <-- 1. REMOVED (Original file)
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Callable, List
+from typing import Dict, Any, Callable, List, Optional
 from trading_bot import AdvancedAdaptiveGridTradingBot
 from core_types import SimulationClock, Tick, Position
+import optuna # <-- NEW: Import Optuna for pruning
 
 # DummyConnector remains a private helper class
 class DummyConnector(ABC):
@@ -38,19 +39,31 @@ class SimulationEngine:
     """
     Handles the time-synchronized, concurrent simulation of one or more trading bots.
     """
-    def __init__(self, df_1m_full: pd.DataFrame, bots: List[AdvancedAdaptiveGridTradingBot], logger=None):
-        self.df_1m_full = df_1m_full.reset_index(drop=True)
+    # --- MODIFIED: Accepts prepared data and a flag ---
+    def __init__(self, data: pd.DataFrame, bots: List[AdvancedAdaptiveGridTradingBot], logger=None, prepared: bool = False):
+        self.data = data # This is either raw 1m data OR prepared merged data
+        self.is_prepared = prepared
+        # --- END MODIFIED ---
+        
         self.bots = bots
         self.logger = logger or logging.getLogger(__name__)
         self.portfolio_equity_curve = []
         self.initial_portfolio_capital = sum(bot.initial_capital for bot in self.bots)
 
     def _prepare_data(self):
+        # --- MODIFIED: Use self.data instead of self.df_1m_full ---
+        if self.is_prepared:
+            # Data is already prepared, just return it
+            return self.data 
+            
+        df_1m_full = self.data.reset_index(drop=True)
+        # --- END MODIFIED ---
+
         # Data prep is done once for all bots, assuming they use the same indicator periods for now.
         # A more advanced version could handle different indicator sets per bot.
         bot_config = self.bots[0].config
         
-        df_30m = self.df_1m_full.set_index('timestamp').resample('30min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).reset_index().dropna()
+        df_30m = df_1m_full.set_index('timestamp').resample('30min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).reset_index().dropna()
         df_30m['short_ema'] = ta.ema(df_30m['close'], length=bot_config.SHORT_EMA_PERIOD)
         df_30m['long_ema'] = ta.ema(df_30m['close'], length=bot_config.LONG_EMA_PERIOD)
         df_30m['rsi'] = ta.rsi(df_30m['close'], length=bot_config.RSI_PERIOD)
@@ -99,7 +112,7 @@ class SimulationEngine:
         df_30m['bb_upper'] = bbands_30m[bbu_col_name]
         # --- END ROBUST FIX ---
 
-        df_1m = self.df_1m_full.copy()
+        df_1m = df_1m_full.copy()
         # --- FIX: Shift all 1m indicators to prevent lookahead ---
         # We use shift(1) so that the data for a given row (e.g., 10:01) is based
         # on the candle that *closed* at 10:00.
@@ -120,8 +133,16 @@ class SimulationEngine:
         
         return df_merged.dropna()
 
-    def run(self):
-        df_merged = self._prepare_data()
+    # --- MODIFIED: Added trial=None for pruning ---
+    def run(self, trial: Optional[optuna.trial.Trial] = None):
+        
+        # --- MODIFIED: Call _prepare_data based on self.is_prepared flag ---
+        try:
+            df_merged = self._prepare_data()
+        except KeyError as e:
+            self.logger.error(f"Failed to prepare data due to missing column: {e}")
+            return None, []
+        # --- END MODIFIED ---
         
         if len(df_merged) < 100:
             self.logger.warning("Backtest failed: Insufficient data after indicator calculation.")
@@ -136,6 +157,12 @@ class SimulationEngine:
             bot.clock = clock
             bot.connector = dummy_connector
             bot.initialize_state(first_row.to_dict())
+            
+            # --- NEW: Set fee from bot's config for accuracy ---
+            fee = getattr(bot.config, 'BYBIT_TAKER_FEE', 0.00055)
+            bot.connector.params['BYBIT_TAKER_FEE'] = fee
+            # --- END NEW ---
+
 
         # --- HIGH-SPEED CONCURRENT SIMULATION LOOP ---
         # random.seed(42) # <-- 2. REMOVED (Original file)
@@ -191,9 +218,28 @@ class SimulationEngine:
             # Record portfolio equity at the end of each 1m candle
             current_portfolio_equity = sum(bot.capital for bot in self.bots)
             self.portfolio_equity_curve.append(current_portfolio_equity)
+            
+            # --- NEW: ADD PRUNING CHECK ---
+            # Check every 1000 candles (approx every 16 hours of trading)
+            if trial and i % 1000 == 0:
+                # Report the intermediate portfolio equity to Optuna
+                trial.report(current_portfolio_equity, i)
+
+                # Check if Optuna thinks this trial should be pruned
+                if trial.should_prune():
+                    # This exception will be caught by the objective function
+                    raise optuna.TrialPruned()
+            # --- END NEW ---
+
 
         # --- Final Performance Calculation ---
         portfolio_results = self._calculate_portfolio_metrics()
+        
+        # --- NEW: Report final value if pruning ---
+        if trial:
+            trial.report(portfolio_results['final_capital'], len(df_merged))
+        # --- END NEW ---
+        
         individual_results = [bot.log_performance(print_log=False) for bot in self.bots]
         
         return portfolio_results, individual_results
@@ -219,12 +265,86 @@ class SimulationEngine:
             "max_drawdown": max_drawdown,
         }
 
-def run_single_backtest(df_1m_full: pd.DataFrame, config_module, verbose: bool = False, logger=None):
+# --- NEW: Wrapper function to prepare data once ---
+def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module) -> pd.DataFrame:
     """
-    A wrapper to run a backtest for a single strategy using the SimulationEngine.
+    Runs only the data preparation step and returns the prepared DataFrame.
+    This allows for a "prepare-once, run-many" optimization loop.
+    """
+    # Create a dummy bot just to get the config for indicators
+    dummy_bot = AdvancedAdaptiveGridTradingBot(
+        initial_capital=0,
+        simulation_clock=SimulationClock(0),
+        config_module=config_module,
+        connector=None,
+        silent=True
+    )
+    
+    # Use a temporary SimulationEngine to just run the _prepare_data method
+    temp_engine = SimulationEngine(df_1m_full, [dummy_bot], prepared=False)
+    
+    try:
+        df_prepared = temp_engine._prepare_data()
+        return df_prepared
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Failed during data preparation: {e}", exc_info=True)
+        return pd.DataFrame() # Return empty dataframe on failure
+
+# --- NEW: Wrapper function to run simulation on PREPARED data ---
+def run_simulation_from_prepared_data(
+    df_prepared: pd.DataFrame, 
+    config_module, 
+    verbose: bool = False, 
+    logger=None, 
+    trial: Optional[optuna.trial.Trial] = None
+):
+    """
+    A wrapper to run a backtest for a single strategy using PREPARED data.
+    This is the fast function called by Optuna.
     """
     bot_config = config_module
-    # Use a default fee if not present, but it should be in the config module
+    fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
+    
+    # Connector is re-created for each bot, but this is lightweight
+    dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
+
+    bot = AdvancedAdaptiveGridTradingBot(
+        initial_capital=bot_config.INITIAL_CAPITAL,
+        simulation_clock=SimulationClock(0), # Engine will manage the clock
+        config_module=bot_config,
+        connector=dummy_connector,
+        silent=not verbose
+    )
+    
+    # --- MODIFIED: Pass prepared=True ---
+    engine = SimulationEngine(df_prepared, [bot], logger, prepared=True)
+    
+    # --- MODIFIED: Pass the trial object to the engine's run method ---
+    portfolio_results, individual_results = engine.run(trial=trial)
+    # --- END MODIFIED ---
+    
+    final_metrics = individual_results[0] if individual_results else {}
+    
+    if verbose and logger and final_metrics:
+        logger.info(final_metrics.get("performance_log_str", "Performance log not available."))
+    elif not final_metrics and portfolio_results:
+        return portfolio_results
+
+    return final_metrics
+
+
+# --- MODIFIED: `run_single_backtest` now supports pruning ---
+def run_single_backtest(
+    df_1m_full: pd.DataFrame, 
+    config_module, 
+    verbose: bool = False, 
+    logger=None, 
+    trial: Optional[optuna.trial.Trial] = None # <-- ADDED trial
+):
+    """
+    A wrapper to run a full (slower) backtest, preparing data first.
+    """
+    bot_config = config_module
     fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
     dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
 
@@ -236,8 +356,11 @@ def run_single_backtest(df_1m_full: pd.DataFrame, config_module, verbose: bool =
         silent=not verbose
     )
     
-    engine = SimulationEngine(df_1m_full, [bot], logger)
-    portfolio_results, individual_results = engine.run()
+    # --- MODIFIED: Pass prepared=False ---
+    engine = SimulationEngine(df_1m_full, [bot], logger, prepared=False)
+    
+    # --- MODIFIED: Pass trial to engine.run ---
+    portfolio_results, individual_results = engine.run(trial=trial)
     
     # For a single run, individual_results will have one item.
     final_metrics = individual_results[0] if individual_results else {}

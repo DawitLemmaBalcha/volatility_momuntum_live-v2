@@ -43,7 +43,7 @@ def setup_optimization_logging():
         opt_logger.addHandler(console_handler)
     return opt_logger
 
-# --- MODIFIED: Accepts pre-prepared DataFrame ---
+# --- MODIFIED: Accepts pre-prepared DataFrame and handles pruning ---
 def objective(trial, df_prepared: pd.DataFrame, opt_logger):
     """The objective function for Optuna, with robust logging and parameter constraints."""
     try:
@@ -63,13 +63,13 @@ def objective(trial, df_prepared: pd.DataFrame, opt_logger):
         trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", 15, 30)
         trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 15, 30)
 
-        # --- MODIFIED: Call the simulation runner directly ---
-        # This skips the data preparation step, saving significant time
+        # --- MODIFIED: Call the simulation runner directly AND PASS THE TRIAL ---
         performance_metrics = run_simulation_from_prepared_data(
             df_prepared, 
             trial_config, 
             verbose=False, 
-            logger=opt_logger
+            logger=opt_logger,
+            trial=trial  # <-- PASS TRIAL FOR PRUNING
         )
 
         if not performance_metrics:
@@ -95,6 +95,13 @@ def objective(trial, df_prepared: pd.DataFrame, opt_logger):
         )
         
         return sortino
+        
+    # --- NEW: Catch pruning exception ---
+    except optuna.TrialPruned:
+        opt_logger.info(f"--- Trial {trial.number} Pruned ---")
+        return -1.0
+    # --- END NEW ---
+    
     except Exception as e:
         opt_logger.error(f"TRIAL #{trial.number} FAILED: {e}", exc_info=True)
         return -1.0
@@ -112,54 +119,58 @@ if __name__ == "__main__":
     # --- NEW: Prepare data ONCE before optimization ---
     optimization_logger.info("Preparing data for all trials...")
     df_prepared = prepare_data_for_simulation(df_1m, config)
-    optimization_logger.info("Data prepared. Starting parallel optimization...")
-    # --- END NEW ---
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize")
     
-    # --- MODIFIED: Pass the prepared DataFrame to the objective ---
-    study.optimize(
-        lambda trial: objective(trial, df_prepared, optimization_logger),
-        n_trials=60,
-        n_jobs=-1,
-        show_progress_bar=True
-    )
+    if df_prepared.empty:
+        optimization_logger.error("Data preparation failed. Exiting optimization.")
+    else:
+        optimization_logger.info("Data prepared. Starting parallel optimization...")
+        # --- END NEW ---
 
-    optimization_logger.info("\n" + "="*50)
-    optimization_logger.info("OPTIMIZATION FINISHED")
-    optimization_logger.info("="*50 + "\n")
-
-    # --- NEW: Get and rank the top 10 trials ---
-    try:
-        # Filter for successfully completed trials and sort them by Sortino ratio
-        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None and t.value > -1.0]
-        sorted_trials = sorted(completed_trials, key=lambda t: t.value, reverse=True)
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="maximize")
         
-        top_trials = sorted_trials[:10] # Get the top 10
+        # --- MODIFIED: Pass the prepared DataFrame to the objective ---
+        study.optimize(
+            lambda trial: objective(trial, df_prepared, optimization_logger),
+            n_trials=20,
+            n_jobs=-1,
+            show_progress_bar=True
+        )
 
-        if not top_trials:
-            raise ValueError("No successful trials were completed.")
+        optimization_logger.info("\n" + "="*50)
+        optimization_logger.info("OPTIMIZATION FINISHED")
+        optimization_logger.info("="*50 + "\n")
 
-        optimization_logger.info(f"--- Top {len(top_trials)} Trials Ranked by Sortino Ratio ---")
+        # --- NEW: Get and rank the top 10 trials ---
+        try:
+            # Filter for successfully completed trials and sort them by Sortino ratio
+            completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None and t.value > -1.0]
+            sorted_trials = sorted(completed_trials, key=lambda t: t.value, reverse=True)
+            
+            top_trials = sorted_trials[:10] # Get the top 10
 
-        for i, trial in enumerate(top_trials):
-            rank = i + 1
-            sortino = trial.value
-            header = f"\n--- Rank #{rank} (Sortino: {sortino:.4f}) ---"
-            optimization_logger.info(header)
+            if not top_trials:
+                raise ValueError("No successful trials were completed.")
 
-            is_log_output = trial.user_attrs.get("performance_log", "Performance log not captured.")
-            optimization_logger.info("--- In-Sample Performance ---")
-            optimization_logger.info(is_log_output)
+            optimization_logger.info(f"--- Top {len(top_trials)} Trials Ranked by Sortino Ratio ---")
 
-            optimization_logger.info("  - Parameters:")
-            params_to_log = trial.params.copy()
-            if "ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER" in params_to_log and "TRAILING_RATIO" in params_to_log:
-                params_to_log['ATR_TRAILING_STOP_MULTIPLIER'] = params_to_log["ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER"] * params_to_log["TRAILING_RATIO"]
+            for i, trial in enumerate(top_trials):
+                rank = i + 1
+                sortino = trial.value
+                header = f"\n--- Rank #{rank} (Sortino: {sortino:.4f}) ---"
+                optimization_logger.info(header)
 
-            for key, value in params_to_log.items():
-                optimization_logger.info(f"    - {key}: {value}")
+                is_log_output = trial.user_attrs.get("performance_log", "Performance log not captured.")
+                optimization_logger.info("--- In-Sample Performance ---")
+                optimization_logger.info(is_log_output)
 
-    except ValueError as e:
-        optimization_logger.warning(f"{e} No best trials can be shown.")
+                optimization_logger.info("  - Parameters:")
+                params_to_log = trial.params.copy()
+                if "ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER" in params_to_log and "TRAILING_RATIO" in params_to_log:
+                    params_to_log['ATR_TRAILING_STOP_MULTIPLIER'] = params_to_log["ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER"] * params_to_log["TRAILING_RATIO"]
+
+                for key, value in params_to_log.items():
+                    optimization_logger.info(f"    - {key}: {value}")
+
+        except ValueError as e:
+            optimization_logger.warning(f"{e} No best trials can be shown.")
