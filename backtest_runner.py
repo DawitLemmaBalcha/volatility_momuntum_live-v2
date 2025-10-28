@@ -34,94 +34,100 @@ class DummyConnector(ABC):
     def start_data_stream(self, on_tick_callback: Callable[[Tick], None]): pass
 
 
+def prepare_data_for_simulation(df_1m_full: pd.DataFrame, bot_config) -> pd.DataFrame:
+    """
+    Pre-calculates all indicators for a simulation run.
+    This is extracted to be run only ONCE per optimization walk.
+    """
+    
+    df_30m = df_1m_full.set_index('timestamp').resample('30min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).reset_index().dropna()
+    df_30m['short_ema'] = ta.ema(df_30m['close'], length=bot_config.SHORT_EMA_PERIOD)
+    df_30m['long_ema'] = ta.ema(df_30m['close'], length=bot_config.LONG_EMA_PERIOD)
+    df_30m['rsi'] = ta.rsi(df_30m['close'], length=bot_config.RSI_PERIOD)
+    df_30m['atr'] = ta.atr(df_30m['high'], df_30m['low'], df_30m['close'], length=bot_config.ATR_PERIOD)
+    macd_30m = ta.macd(df_30m['close'], fast=bot_config.MACD_FAST_PERIOD, slow=bot_config.MACD_SLOW_PERIOD, signal=bot_config.MACD_SIGNAL_PERIOD)
+    df_30m['macd'] = macd_30m[f'MACD_{bot_config.MACD_FAST_PERIOD}_{bot_config.MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}']
+
+    # --- ROBUST FIX: Handle pandas_ta bbands column naming conventions ---
+    bb_period = bot_config.BOLLINGER_PERIOD
+    bb_std = bot_config.BOLLINGER_STD_DEV
+    
+    bbands_30m = ta.bbands(df_30m['close'], length=bb_period, std=bb_std)
+
+    # pandas-ta has inconsistent naming. We must find the column.
+    bbl_col_name = None
+    bbu_col_name = None
+
+    # 1. Try common patterns first
+    patterns_to_try = [
+        f'BBL_{bb_period}_{bb_std}',      # e.g., 'BBL_20_2.0'
+        f'BBL_{bb_period}_{int(bb_std)}',  # e.g., 'BBL_20_2'
+        f'BBL_{bb_period}'              # e.g., 'BBL_20' (if std is default)
+    ]
+    
+    for pattern in patterns_to_try:
+        if pattern in bbands_30m.columns:
+            bbl_col_name = pattern
+            bbu_col_name = pattern.replace('BBL', 'BBU') # Assumes BBU follows the same pattern
+            break
+    
+    # 2. If no pattern matched, find the first column that starts with 'BBL_'
+    if bbl_col_name is None:
+        try:
+            bbl_col_name = [col for col in bbands_30m.columns if col.startswith('BBL_')][0]
+            # Find corresponding BBU
+            bbu_suffix = bbl_col_name[4:] # Get the suffix (e.g., '_20_2.0')
+            bbu_col_name = f'BBU{bbu_suffix}'
+            if bbu_col_name not in bbands_30m.columns:
+                # Fallback for BBU
+                bbu_col_name = [col for col in bbands_30m.columns if col.startswith('BBU_')][0]
+        except IndexError:
+            # If we still can't find it, raise a helpful error
+            raise KeyError(f"Could not find Bollinger Bands columns in {bbands_30m.columns}. Looked for patterns like 'BBL_20_2.0', 'BBL_20_2', 'BBL_20', etc.")
+
+    df_30m['bb_lower'] = bbands_30m[bbl_col_name]
+    df_30m['bb_upper'] = bbands_30m[bbu_col_name]
+    # --- END ROBUST FIX ---
+
+    df_1m = df_1m_full.copy()
+    # --- FIX: Shift all 1m indicators to prevent lookahead ---
+    # We use shift(1) so that the data for a given row (e.g., 10:01) is based
+    # on the candle that *closed* at 10:00.
+    df_1m['rsi_1m'] = ta.rsi(df_1m['close'], length=bot_config.CONFIRMATION_RSI_PERIOD).shift(1)
+    df_1m['volume_ma_1m'] = df_1m['volume'].rolling(window=bot_config.CONFIRMATION_VOLUME_MA_PERIOD).mean().shift(1)
+    macd_1m = ta.macd(df_1m['close'], fast=bot_config.CONFIRMATION_MACD_FAST_PERIOD, slow=bot_config.CONFIRMATION_MACD_SLOW_PERIOD, signal=bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD)
+    df_1m['macd_1m'] = macd_1m[f'MACD_{bot_config.CONFIRMATION_MACD_FAST_PERIOD}_{bot_config.CONFIRMATION_MACD_SLOW_PERIOD}_{bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD}'].shift(1)
+    
+    indicator_cols = ['timestamp', 'short_ema', 'long_ema', 'rsi', 'atr', 'macd', 'bb_lower', 'bb_upper']
+    # --- FIX: Shift 30m indicators to prevent lookahead ---
+    # We shift them here so that when merge_asof finds the 10:00 30m bar,
+    # it's using the indicators calculated at 09:30 (the last *closed* bar).
+    for col in indicator_cols:
+        if col != 'timestamp':
+            df_30m[col] = df_30m[col].shift(1)
+            
+    df_merged = pd.merge_asof(df_1m.sort_values('timestamp'), df_30m[indicator_cols].sort_values('timestamp'), on='timestamp', direction='backward')
+    
+    return df_merged.dropna()
+
+
 class SimulationEngine:
     """
     Handles the time-synchronized, concurrent simulation of one or more trading bots.
     """
-    def __init__(self, df_1m_full: pd.DataFrame, bots: List[AdvancedAdaptiveGridTradingBot], logger=None):
-        self.df_1m_full = df_1m_full.reset_index(drop=True)
+    # --- MODIFIED: Accepts a pre-prepared DataFrame ---
+    def __init__(self, df_prepared: pd.DataFrame, bots: List[AdvancedAdaptiveGridTradingBot], logger=None):
+        self.df_prepared = df_prepared.reset_index(drop=True)
         self.bots = bots
         self.logger = logger or logging.getLogger(__name__)
         self.portfolio_equity_curve = []
         self.initial_portfolio_capital = sum(bot.initial_capital for bot in self.bots)
 
-    def _prepare_data(self):
-        # Data prep is done once for all bots, assuming they use the same indicator periods for now.
-        # A more advanced version could handle different indicator sets per bot.
-        bot_config = self.bots[0].config
-        
-        df_30m = self.df_1m_full.set_index('timestamp').resample('30min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}).reset_index().dropna()
-        df_30m['short_ema'] = ta.ema(df_30m['close'], length=bot_config.SHORT_EMA_PERIOD)
-        df_30m['long_ema'] = ta.ema(df_30m['close'], length=bot_config.LONG_EMA_PERIOD)
-        df_30m['rsi'] = ta.rsi(df_30m['close'], length=bot_config.RSI_PERIOD)
-        df_30m['atr'] = ta.atr(df_30m['high'], df_30m['low'], df_30m['close'], length=bot_config.ATR_PERIOD)
-        macd_30m = ta.macd(df_30m['close'], fast=bot_config.MACD_FAST_PERIOD, slow=bot_config.MACD_SLOW_PERIOD, signal=bot_config.MACD_SIGNAL_PERIOD)
-        df_30m['macd'] = macd_30m[f'MACD_{bot_config.MACD_FAST_PERIOD}_{bot_config.MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}']
-
-        # --- ROBUST FIX: Handle pandas_ta bbands column naming conventions ---
-        bb_period = bot_config.BOLLINGER_PERIOD
-        bb_std = bot_config.BOLLINGER_STD_DEV
-        
-        bbands_30m = ta.bbands(df_30m['close'], length=bb_period, std=bb_std)
-
-        # pandas-ta has inconsistent naming. We must find the column.
-        bbl_col_name = None
-        bbu_col_name = None
-
-        # 1. Try common patterns first
-        patterns_to_try = [
-            f'BBL_{bb_period}_{bb_std}',      # e.g., 'BBL_20_2.0'
-            f'BBL_{bb_period}_{int(bb_std)}',  # e.g., 'BBL_20_2'
-            f'BBL_{bb_period}'              # e.g., 'BBL_20' (if std is default)
-        ]
-        
-        for pattern in patterns_to_try:
-            if pattern in bbands_30m.columns:
-                bbl_col_name = pattern
-                bbu_col_name = pattern.replace('BBL', 'BBU') # Assumes BBU follows the same pattern
-                break
-        
-        # 2. If no pattern matched, find the first column that starts with 'BBL_'
-        if bbl_col_name is None:
-            try:
-                bbl_col_name = [col for col in bbands_30m.columns if col.startswith('BBL_')][0]
-                # Find corresponding BBU
-                bbu_suffix = bbl_col_name[4:] # Get the suffix (e.g., '_20_2.0')
-                bbu_col_name = f'BBU{bbu_suffix}'
-                if bbu_col_name not in bbands_30m.columns:
-                    # Fallback for BBU
-                    bbu_col_name = [col for col in bbands_30m.columns if col.startswith('BBU_')][0]
-            except IndexError:
-                # If we still can't find it, raise a helpful error
-                raise KeyError(f"Could not find Bollinger Bands columns in {bbands_30m.columns}. Looked for patterns like 'BBL_20_2.0', 'BBL_20_2', 'BBL_20', etc.")
-
-        df_30m['bb_lower'] = bbands_30m[bbl_col_name]
-        df_30m['bb_upper'] = bbands_30m[bbu_col_name]
-        # --- END ROBUST FIX ---
-
-        df_1m = self.df_1m_full.copy()
-        # --- FIX: Shift all 1m indicators to prevent lookahead ---
-        # We use shift(1) so that the data for a given row (e.g., 10:01) is based
-        # on the candle that *closed* at 10:00.
-        df_1m['rsi_1m'] = ta.rsi(df_1m['close'], length=bot_config.CONFIRMATION_RSI_PERIOD).shift(1)
-        df_1m['volume_ma_1m'] = df_1m['volume'].rolling(window=bot_config.CONFIRMATION_VOLUME_MA_PERIOD).mean().shift(1)
-        macd_1m = ta.macd(df_1m['close'], fast=bot_config.CONFIRMATION_MACD_FAST_PERIOD, slow=bot_config.CONFIRMATION_MACD_SLOW_PERIOD, signal=bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD)
-        df_1m['macd_1m'] = macd_1m[f'MACD_{bot_config.CONFIRMATION_MACD_FAST_PERIOD}_{bot_config.CONFIRMATION_MACD_SLOW_PERIOD}_{bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD}'].shift(1)
-        
-        indicator_cols = ['timestamp', 'short_ema', 'long_ema', 'rsi', 'atr', 'macd', 'bb_lower', 'bb_upper']
-        # --- FIX: Shift 30m indicators to prevent lookahead ---
-        # We shift them here so that when merge_asof finds the 10:00 30m bar,
-        # it's using the indicators calculated at 09:30 (the last *closed* bar).
-        for col in indicator_cols:
-            if col != 'timestamp':
-                df_30m[col] = df_30m[col].shift(1)
-                
-        df_merged = pd.merge_asof(df_1m.sort_values('timestamp'), df_30m[indicator_cols].sort_values('timestamp'), on='timestamp', direction='backward')
-        
-        return df_merged.dropna()
+    # --- REMOVED: _prepare_data method is now external ---
 
     def run(self):
-        df_merged = self._prepare_data()
+        # --- MODIFIED: Use df_prepared directly ---
+        df_merged = self.df_prepared
         
         if len(df_merged) < 100:
             self.logger.warning("Backtest failed: Insufficient data after indicator calculation.")
@@ -135,6 +141,10 @@ class SimulationEngine:
         for bot in self.bots:
             bot.clock = clock
             bot.connector = dummy_connector
+            # --- MODIFIED: Pass dummy_connector's params to initialize_state ---
+            # This ensures the connector's fee is available to the bot if needed
+            # Although the bot currently uses config for fee, this is more robust
+            bot.connector.params['BYBIT_TAKER_FEE'] = getattr(bot.config, 'BYBIT_TAKER_FEE', 0.00055)
             bot.initialize_state(first_row.to_dict())
 
         # --- HIGH-SPEED CONCURRENT SIMULATION LOOP ---
@@ -219,12 +229,13 @@ class SimulationEngine:
             "max_drawdown": max_drawdown,
         }
 
-def run_single_backtest(df_1m_full: pd.DataFrame, config_module, verbose: bool = False, logger=None):
+# --- NEW: Function to run simulation from PREPARED data ---
+# This is what 'optimize.py' and 'walk_forward_optimizer.py' will call
+def run_simulation_from_prepared_data(df_prepared: pd.DataFrame, config_module, verbose: bool = False, logger=None):
     """
-    A wrapper to run a backtest for a single strategy using the SimulationEngine.
+    Runs a single bot simulation using pre-calculated indicator data.
     """
     bot_config = config_module
-    # Use a default fee if not present, but it should be in the config module
     fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
     dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
 
@@ -236,17 +247,28 @@ def run_single_backtest(df_1m_full: pd.DataFrame, config_module, verbose: bool =
         silent=not verbose
     )
     
-    engine = SimulationEngine(df_1m_full, [bot], logger)
+    # --- MODIFIED: Pass the prepared data to the engine ---
+    engine = SimulationEngine(df_prepared, [bot], logger)
     portfolio_results, individual_results = engine.run()
     
-    # For a single run, individual_results will have one item.
     final_metrics = individual_results[0] if individual_results else {}
     
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))
-    # Also return portfolio metrics, which contain the correct final capital
     elif not final_metrics and portfolio_results:
-        # If bot failed (e.g., no trades), return portfolio stats
         return portfolio_results
 
     return final_metrics
+
+
+# --- MODIFIED: run_single_backtest is now a simple wrapper ---
+def run_single_backtest(df_1m_full: pd.DataFrame, config_module, verbose: bool = False, logger=None):
+    """
+    A wrapper to PREPARE data and then run a single backtest.
+    Used by 'main.py' or for one-off tests.
+    """
+    # 1. Prepare data
+    df_prepared = prepare_data_for_simulation(df_1m_full, config_module)
+    
+    # 2. Run simulation
+    return run_simulation_from_prepared_data(df_prepared, config_module, verbose, logger)

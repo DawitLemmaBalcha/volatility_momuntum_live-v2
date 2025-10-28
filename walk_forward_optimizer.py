@@ -12,7 +12,8 @@ import copy
 import config
 from data_fetcher import fetch_all_dataframes
 from optimize import objective, ConfigContainer # Import the objective and the container
-from backtest_runner import run_single_backtest # <-- FIX 1: Import the correct function name
+# --- MODIFIED: Import new simulation functions ---
+from backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
 
 # --- NEW: Global list to store results from all walks ---
 all_trials_data = []
@@ -52,7 +53,23 @@ def run_single_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, 
         _, df_full, _ = fetch_all_dataframes()
         df_is = df_full[(df_full['timestamp'] >= pd.to_datetime(is_start)) & (df_full['timestamp'] < pd.to_datetime(is_end))].copy()
         df_oos = df_full[(df_full['timestamp'] >= pd.to_datetime(is_end)) & (df_full['timestamp'] < pd.to_datetime(oos_end))].copy()
-        opt_logger.info(f"Data loaded. IS records: {len(df_is)}, OOS records: {len(df_oos)}")
+        
+        if df_is.empty or len(df_is) < 200:
+             opt_logger.error(f"Skipping walk {walk_number}. In-sample data is empty or too small ({len(df_is)} records).")
+             return
+        if df_oos.empty or len(df_oos) < 200:
+             opt_logger.error(f"Skipping walk {walk_number}. Out-of-sample data is empty or too small ({len(df_oos)} records).")
+             return
+
+        # --- NEW: Prepare IS data ONCE ---
+        opt_logger.info(f"Data loaded. Preparing {len(df_is)} IS records...")
+        df_is_prepared = prepare_data_for_simulation(df_is, config)
+        opt_logger.info(f"IS data prepared. {len(df_is_prepared)} records usable.")
+        
+        if df_is_prepared.empty:
+            opt_logger.error(f"Skipping walk {walk_number}. In-sample data was unusable after preparation.")
+            return
+
     except Exception as e:
         opt_logger.error(f"Failed to fetch or slice data: {e}", exc_info=True)
         return
@@ -62,8 +79,9 @@ def run_single_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize") 
     
+    # --- MODIFIED: Pass prepared IS data to objective ---
     study.optimize(
-        lambda trial: objective(trial, df_is, opt_logger),
+        lambda trial: objective(trial, df_is_prepared, opt_logger),
         n_trials=n_trials,
         n_jobs=-1,
         show_progress_bar=True
@@ -106,7 +124,7 @@ def run_single_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, 
             opt_logger.info(f"\n--- OUT-OF-SAMPLE PERFORMANCE [RANK #{rank}] ---")
             opt_logger.info(f"Parameters being tested (Out-of-Sample):\n{json.dumps(optimal_params, indent=4)}")
             
-            # --- FIX 2: Create a config container for the OOS backtest ---
+            # --- MODIFIED: Create a config container for the OOS backtest ---
             oos_config = ConfigContainer()
             for attr in dir(config):
                 if attr.isupper():
@@ -119,8 +137,20 @@ def run_single_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, 
             # Recalculate the dependent parameter
             oos_config.ATR_TRAILING_STOP_MULTIPLIER = oos_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER * oos_config.TRAILING_RATIO
 
-            # Run the OOS backtest and capture the results
-            oos_performance = run_single_backtest(df_oos, oos_config, logger=opt_logger, verbose=True)
+            # --- NEW: Prepare OOS data ONCE for this trial ---
+            df_oos_prepared = prepare_data_for_simulation(df_oos, oos_config)
+            
+            if df_oos_prepared.empty:
+                opt_logger.error("OOS data was unusable after preparation. Skipping OOS test.")
+                oos_performance = {}
+            else:
+                # --- MODIFIED: Run the OOS backtest using the new function ---
+                oos_performance = run_simulation_from_prepared_data(
+                    df_oos_prepared, 
+                    oos_config, 
+                    logger=opt_logger, 
+                    verbose=True
+                )
             
             opt_logger.info(f"--- OOS TEST for RANK #{rank} COMPLETE ---")
 

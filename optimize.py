@@ -19,7 +19,8 @@ from datetime import datetime
 import json
 import config
 from data_fetcher import fetch_all_dataframes
-from backtest_runner import run_single_backtest
+# --- MODIFIED: Import new simulation functions ---
+from backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
 
 # --- A simple, pickle-able class to hold config values ---
 class ConfigContainer:
@@ -42,7 +43,8 @@ def setup_optimization_logging():
         opt_logger.addHandler(console_handler)
     return opt_logger
 
-def objective(trial, df_1m_full: pd.DataFrame, opt_logger):
+# --- MODIFIED: Accepts pre-prepared DataFrame ---
+def objective(trial, df_prepared: pd.DataFrame, opt_logger):
     """The objective function for Optuna, with robust logging and parameter constraints."""
     try:
         trial_config = ConfigContainer()
@@ -61,7 +63,14 @@ def objective(trial, df_1m_full: pd.DataFrame, opt_logger):
         trial_config.CONFIRMATION_RSI_PERIOD = trial.suggest_int("CONFIRMATION_RSI_PERIOD", 15, 30)
         trial_config.CONFIRMATION_VOLUME_MA_PERIOD = trial.suggest_int("CONFIRMATION_VOLUME_MA_PERIOD", 15, 30)
 
-        performance_metrics = run_single_backtest(df_1m_full, trial_config, verbose=False)
+        # --- MODIFIED: Call the simulation runner directly ---
+        # This skips the data preparation step, saving significant time
+        performance_metrics = run_simulation_from_prepared_data(
+            df_prepared, 
+            trial_config, 
+            verbose=False, 
+            logger=opt_logger
+        )
 
         if not performance_metrics:
             return -1.0 
@@ -99,13 +108,19 @@ if __name__ == "__main__":
     
     optimization_logger.info("Loading historical data...")
     _, df_1m, _ = fetch_all_dataframes()
-    optimization_logger.info("Data loaded. Starting parallel optimization...")
+    
+    # --- NEW: Prepare data ONCE before optimization ---
+    optimization_logger.info("Preparing data for all trials...")
+    df_prepared = prepare_data_for_simulation(df_1m, config)
+    optimization_logger.info("Data prepared. Starting parallel optimization...")
+    # --- END NEW ---
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(direction="maximize")
     
+    # --- MODIFIED: Pass the prepared DataFrame to the objective ---
     study.optimize(
-        lambda trial: objective(trial, df_1m, optimization_logger),
+        lambda trial: objective(trial, df_prepared, optimization_logger),
         n_trials=60,
         n_jobs=-1,
         show_progress_bar=True
