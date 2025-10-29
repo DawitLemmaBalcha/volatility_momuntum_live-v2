@@ -1,4 +1,4 @@
-# connectors/bybit_testnet_connector.py
+# connectors/bybit_demo_connector.py
 
 import logging
 import time
@@ -7,7 +7,7 @@ from .base_connector import BaseConnector
 from typing import Dict, Any, Callable
 from core_types import Tick, Position
 
-class BybitTestnetConnector(BaseConnector):
+class BybitDemoConnector(BaseConnector):
     """
     A dedicated, fully functional connector for paper trading on the Bybit Testnet.
     This connector is hardcoded with testnet=True for safety.
@@ -161,7 +161,7 @@ class BybitTestnetConnector(BaseConnector):
             self.logger.error(f"Error processing WebSocket message: {e}")
 
 
-# ... (inside the BybitTestnetConnector class) ...
+# ... (inside the BybitDemoConnector class) ...
 
     def get_wallet_balance(self, coin: str) -> float:
         """

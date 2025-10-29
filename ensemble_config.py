@@ -8,13 +8,13 @@ try:
 except ImportError:
     MetaTraderConnector = BybitConnector = None
 
-from connectors.bybit_testnet_connector import BybitTestnetConnector
+from connectors.bybit_demo_connector import BybitDemoConnector
 from connectors.dummy_connector import DummyConnector
 
 # --- !! DEBUGGING STEP !! ---
 # Let's print the key right after trying to load it to see what's happening.
-testnet_key = os.getenv("BYBIT_TESTNET_API_KEY")
-print(f"--- DEBUG: Attempting to load BYBIT_TESTNET_API_KEY. Value found: '{testnet_key}' ---")
+demo_key = os.getenv("BYBIT_DEMO_API_KEY")
+print(f"--- DEBUG: Attempting to load BYBIT_DEMO_API_KEY. Value found: '{demo_key}' ---")
 # --- !! END DEBUGGING STEP !! ---
 
 VENUES = {
@@ -29,10 +29,10 @@ VENUES = {
     # --- Paper Trading Venue ---
     "bybit_paper_trading": {
         "mode": "live",
-        "connector_class": BybitTestnetConnector,
+        "connector_class": BybitDemoConnector,
         "connection_params": {
-             "api_key": testnet_key, # Use the variable we loaded for debugging
-             "api_secret": os.getenv("BYBIT_TESTNET_API_SECRET"),
+             "api_key": demo_key, # Use the variable we loaded for debugging
+             "api_secret": os.getenv("BYBIT_DEMO_API_SECRET"),
         },
         "strategies": [
             "strategies/aggressive_1.py",

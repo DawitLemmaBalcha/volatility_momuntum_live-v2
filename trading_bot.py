@@ -19,9 +19,13 @@ def format_time(timestamp: float) -> str:
 class AdvancedAdaptiveGridTradingBot:
     def __init__(self, initial_capital: float, simulation_clock: SimulationClock, config_module, connector: BaseConnector, silent: bool = False):
         self.config = config_module
+        
+        # --- MODIFIED: These are now just the STARTING values ---
         self.initial_capital = initial_capital
-        self.capital = initial_capital
-        self.peak_capital = initial_capital
+        self.capital = initial_capital      # This is now the "realized" capital
+        self.peak_capital = initial_capital # This will be synced from the master
+        # --- END MODIFIED ---
+        
         self.clock = simulation_clock
         self.connector = connector
         self.silent = silent
@@ -30,26 +34,63 @@ class AdvancedAdaptiveGridTradingBot:
         self.kelly_fraction = self.config.KELLY_FRACTION
         self.max_position_size = self.config.MAX_POSITION_SIZE_PERCENT
         
-        # --- NEW: Degrading position sizing parameters ---
-        # Load from config, default to 1.0 (no degradation) if not specified
         self.position_degrading_factor = getattr(self.config, 'POSITION_DEGRADING_FACTOR', 1.0) 
         self.trades_since_grid_rebuild = 0
-        # --- END NEW ---
 
         self.open_positions, self.grid_orders, self.trade_history = [], [], []
         self.max_drawdown, self.last_grid_setup_time, self.grid_size, self.trend_regime = 0.0, 0, 0.01, "uninitialized"
 
-        # --- NEW: Counters for Grid Stats ---
         self.total_grids_built = 0
         self.total_grids_traded = 0
+        
+        # --- NEW: Store unrealized PnL from the master ---
+        self.unrealized_pnl = 0.0
         # --- END NEW ---
 
+    def update_strategy_on_30m(self, data_row: dict):
+        old_trend_regime = self.trend_regime
+        self.trend_regime = self._get_trend_regime(data_row)
+        rebuild_reason = None
+        if self.trend_regime != old_trend_regime: rebuild_reason = f"Strategy Shift to {self.trend_regime}"
+        elif not self.open_positions and self.clock.time() - self.last_grid_setup_time > getattr(self.config, 'GRID_MAX_LIFESPAN_SECONDS', 14400): rebuild_reason = "Grid Lifespan Expired"
+        if rebuild_reason: self.setup_asymmetric_grid(rebuild_reason, data_row)
+        self.update_kelly_fraction()
+        
+        # --- MODIFIED: Agnostic Capital/Drawdown Check ---
+        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
+        current_total_equity = 0.0
+
+        if is_backtest:
+            # In backtest, we are the "master" and must calculate our own UPL and peak equity
+            unrealized_pnl = 0.0
+            if self.clock.current_price > 0:
+                for pos in self.open_positions:
+                    # We use 'close' from the 30m data row as the mark-to-market price
+                    unrealized_pnl += pos.calculate_profit(data_row.get('close', self.clock.current_price))
+
+            current_total_equity = self.capital + unrealized_pnl
+            if current_total_equity > self.peak_capital:
+                self.peak_capital = current_total_equity
+            
+            current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
+        
+        else:
+            # In live mode, we are a "slave" and use the synced values
+            current_total_equity = self.capital + self.unrealized_pnl
+            # 'self.peak_capital' is updated by the 'update_live_equity' master sync
+            current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
+        # --- END MODIFIED ---
+        
+        self.max_drawdown = max(self.max_drawdown, current_drawdown)
+        if current_drawdown > self.config.MAX_DRAWDOWN_PERCENT: self.gradual_de_risk()
 
     def initialize_state(self, initial_data_row: dict):
+        # ... (no changes in this function) ...
         self.trend_regime = self._get_trend_regime(initial_data_row)
         self.setup_asymmetric_grid("Initial Setup", initial_data_row)
 
     def _get_trend_regime(self, data_row: dict) -> str:
+        # ... (no changes in this function) ...
         short_ma, long_ma, rsi, macd = data_row.get('short_ema', 0), data_row.get('long_ema', 0), data_row.get('rsi', 50), data_row.get('macd', 0)
         bb_upper, bb_lower, current_price = data_row.get('bb_upper', 0), data_row.get('bb_lower', 0), data_row.get('close', 0)
         trend = "neutral"
@@ -64,17 +105,14 @@ class AdvancedAdaptiveGridTradingBot:
         return f"{trend}_{regime}"
 
     def setup_asymmetric_grid(self, reason: str, data_row: dict):
+        # ... (no changes in this function) ...
         current_time = self.clock.time()
-        # --- NEW: Add Timestamp to Grid Rebuild Log ---
         current_time_str = format_time(current_time)
-        # --- END NEW ---
         if current_time - self.last_grid_setup_time < self.config.GRID_SETUP_COOLDOWN_SECONDS: return
         current_price = data_row['close']
         self.grid_orders.clear() # Clear before calculating new ones
         
-        # --- NEW: Reset the trade counter. This implements the "grid set" logic. ---
         self.trades_since_grid_rebuild = 0
-        # --- END NEW ---
         
         old_grid_size = self.grid_size
         bb_width = (data_row['bb_upper'] - data_row['bb_lower']) / current_price if current_price > 0 else 0
@@ -91,39 +129,29 @@ class AdvancedAdaptiveGridTradingBot:
         new_grid_orders = [] # Build temporary list first for logging
         for i in range(1, upper_grids + 1):
             price = current_price * (1 + i * self.grid_size)
-            # --- MODIFIED: Size calculation removed ---
             new_order = Order(price, "buy")
             new_grid_orders.append(new_order)
             if not self.silent:
-                # --- MODIFIED: Simplified log ---
                 default_logger.info(f"{current_time_str} - Created internal grid level: buy @ stop {new_order.price:,.2f}")
-            # --- END MODIFIED ---
         for i in range(1, lower_grids + 1):
             price = current_price * (1 - i * self.grid_size)
-            # --- MODIFIED: Size calculation removed ---
             new_order = Order(price, "sell")
             new_grid_orders.append(new_order)
             if not self.silent:
-                # --- MODIFIED: Simplified log ---
                 default_logger.info(f"{current_time_str} - Created internal grid level: sell @ stop {new_order.price:,.2f}")
-            # --- END MODIFIED ---
 
         self.grid_orders = new_grid_orders # Assign the fully built list
-        # --- NEW: Increment Grid Built Counter ---
         if self.grid_orders: # Only count if grids were actually created
             self.total_grids_built += len(self.grid_orders)
-        # --- END NEW ---
 
-        # Keep the summary log
         if not self.silent:
             buy_grids = [o for o in self.grid_orders if o.order_type == 'buy']
             sell_grids = [o for o in self.grid_orders if o.order_type == 'sell']
-            # --- MODIFIED: Add Timestamp ---
             default_logger.info(f"\n{current_time_str} - [GRID REBUILT] Reason: {reason}\n  - Center Price:    {current_price:,.2f}\n  - Trend/Regime:    {self.trend_regime}\n  - Grid Size:       {self.grid_size:.3%} (was {old_grid_size:.3%})\n  - Setup:           {len(buy_grids)} Buy Grids | {len(sell_grids)} Sell Grids\n  - Buy Levels:      [ {', '.join([f'{o.price:,.2f}' for o in buy_grids])} ]\n  - Sell Levels:     [ {', '.join([f'{o.price:,.2f}' for o in sell_grids])} ]")
-            # --- END MODIFIED ---
         self.last_grid_setup_time = current_time
 
     def update_strategy_on_30m(self, data_row: dict):
+        # ... (no changes in this function) ...
         old_trend_regime = self.trend_regime
         self.trend_regime = self._get_trend_regime(data_row)
         rebuild_reason = None
@@ -131,29 +159,31 @@ class AdvancedAdaptiveGridTradingBot:
         elif not self.open_positions and self.clock.time() - self.last_grid_setup_time > getattr(self.config, 'GRID_MAX_LIFESPAN_SECONDS', 14400): rebuild_reason = "Grid Lifespan Expired"
         if rebuild_reason: self.setup_asymmetric_grid(rebuild_reason, data_row)
         self.update_kelly_fraction()
-        if self.capital > self.peak_capital: self.peak_capital = self.capital
-        current_drawdown = (self.peak_capital - self.capital) / self.peak_capital * 100 if self.peak_capital > 0 else 0
+        
+        # --- MODIFIED: Capital and peak are now managed by update_live_equity() ---
+        # We still calculate drawdown, but based on the synced values.
+        current_total_equity = self.capital + self.unrealized_pnl
+        current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
+        # --- END MODIFIED ---
+        
         self.max_drawdown = max(self.max_drawdown, current_drawdown)
         if current_drawdown > self.config.MAX_DRAWDOWN_PERCENT: self.gradual_de_risk()
 
     def check_exits_on_1m(self, current_price: float, atr: float):
+        # ... (no changes in this function) ...
         current_time = self.clock.time()
         current_time_str = format_time(current_time) # Get formatted time once
         for position in self.open_positions[:]:
-            # --- MODIFIED: Add Timestamp to Time Stop ---
             if current_time - position.entry_time > getattr(self.config, 'MAX_POSITION_DURATION_SECONDS', 86400):
                 if not self.silent: default_logger.info(f"{current_time_str} - Triggering Time Stop for position {position.id}")
                 self.close_position(position, current_price, "Time Stop"); continue
-            # --- END MODIFIED ---
             if not (atr > 0 and pd.notna(atr)): continue
             if position.stop_loss is None: position.stop_loss = position.entry_price - (atr * self.config.ATR_INITIAL_STOP_MULTIPLIER) if position.is_long else position.entry_price + (atr * self.config.ATR_INITIAL_STOP_MULTIPLIER)
             activation_price = position.entry_price + (atr * self.config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER) if position.is_long else position.entry_price - (atr * self.config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER)
 
-            # --- MODIFIED: Add Timestamp to Trail Activation ---
             if not position.is_trailing_active and ((position.is_long and current_price >= activation_price) or (not position.is_long and current_price <= activation_price)):
                 position.is_trailing_active = True
                 if not self.silent: default_logger.info(f"{current_time_str} - Trailing stop activated for position {position.id} at price {current_price:,.2f}.")
-            # --- END MODIFIED ---
 
             if position.is_trailing_active:
                 trailing_distance = atr * self.config.ATR_TRAILING_STOP_MULTIPLIER
@@ -163,19 +193,15 @@ class AdvancedAdaptiveGridTradingBot:
                 else:
                     position.peak_price = min(position.peak_price, current_price)
                     new_stop = min(position.stop_loss, position.peak_price + trailing_distance)
-                # Log only if the trailing stop moves
-                # if new_stop != position.stop_loss and not self.silent:
-                #     default_logger.info(f"{current_time_str} - Trailing stop moved for pos {position.id} to {new_stop:,.2f}")
                 position.stop_loss = new_stop
 
-            # --- MODIFIED: Add Timestamp to Stop Trigger ---
             if position.stop_loss is not None and ((position.is_long and current_price <= position.stop_loss) or (not position.is_long and current_price >= position.stop_loss)):
                 exit_reason = "Trail Stop" if position.is_trailing_active else "ATR Stop"
                 if not self.silent: default_logger.info(f"{current_time_str} - Triggering {exit_reason} for position {position.id} at price {current_price:,.2f} (Stop: {position.stop_loss:,.2f})")
                 self.close_position(position, current_price, exit_reason)
-            # --- END MODIFIED ---
 
     def check_entries_on_tick(self, tick: Tick, rsi_1m: float, macd_1m: float, volume_1m: float, volume_ma_1m: float, atr: float):
+        # ... (no changes in this function) ...
         for order in self.grid_orders[:]:
             if (order.order_type == "buy" and tick.price >= order.price) or (order.order_type == "sell" and tick.price <= order.price):
 
@@ -185,15 +211,11 @@ class AdvancedAdaptiveGridTradingBot:
                 else: rsi_ok, macd_ok = rsi_1m < self.config.RSI_SELL_CONFIRMATION, macd_1m < 0
 
                 if rsi_ok and macd_ok and volume_ok:
-                    # --- NEW: Add Timestamp to Trigger Log ---
                     if not self.silent: default_logger.info(f"{format_time(tick.timestamp)} - Grid level triggered: {order.order_type} @ {order.price:,.2f} by tick price {tick.price:,.2f}")
-                    # --- END NEW ---
                     
-                    # --- MODIFIED: Calculate size "Just-in-Time" ---
                     size, size_details_str = self.calculate_position_size(tick.price, return_details=True)
                     if not self.silent:
                         default_logger.info(f"{format_time(tick.timestamp)} - {size_details_str}")
-                    # --- END MODIFIED ---
                     
                     details = {
                         "price_ok": f"{tick.price:,.2f} {' >=' if order.order_type == 'buy' else ' <='} {order.price:,.2f}",
@@ -204,58 +226,54 @@ class AdvancedAdaptiveGridTradingBot:
                         "volume_req": volume_ma_1m * getattr(self.config, 'VOLUME_CONFIRMATION_FACTOR', 1.0)
                     }
                     
-                    # --- MODIFIED: Pass the calculated size to execute_trade ---
                     self.execute_trade(order, size, details, atr)
                     self.grid_orders.remove(order) # Remove after execution attempt
 
-    # --- MODIFIED: Signature changed to accept 'amount' ---
     def execute_trade(self, order: Order, amount: float, confirmation_details: dict, atr: float):
-        current_time_str = format_time(self.clock.time()) # Get formatted time
+        # ... (function logic is the same) ...
+        # ... BUT, the `self.capital` it reads in `close_position` will be the synced one.
         
-        # --- MODIFIED: Check the passed 'amount' ---
+        current_time_str = format_time(self.clock.time()) 
+        
         if len(self.open_positions) >= self.config.MAX_POSITIONS or amount <= 0: 
             if amount <= 0 and not self.silent:
                 default_logger.info(f"{current_time_str} - Skipping trade. Calculated size is {amount:.5f}.")
             return
-        # --- END MODIFIED ---
         
         direction = 'LONG' if order.order_type == 'buy' else 'SHORT'
-
-        # --- Log attempt ---
-        # --- MODIFIED: Use 'amount' in log ---
         if not self.silent: default_logger.info(f"{current_time_str} - Attempting to place order via connector: {order.order_type} {amount:.5f} {self.symbol}")
 
-        # --- MODIFIED: Use 'amount' in connector call ---
         result = self.connector.place_order(symbol=self.symbol, side=order.order_type, order_type="Market", qty=amount, price=order.price)
         if not result or not result.get("success"):
             if not self.silent: default_logger.error(f"{current_time_str} - Connector failed to place order.")
             return
 
-        # --- NEW: Increment Grid Traded Counter ---
         self.total_grids_traded += 1
-        
-        # --- NEW: Increment "trades since rebuild" counter ---
         self.trades_since_grid_rebuild += 1
-        # --- END NEW ---
 
         entry_price = result['entry_price']
-        # --- MODIFIED: Use 'amount' to create Position ---
         new_position = Position(entry_price, amount, direction == 'LONG')
+        # --- NEW: Set symbol on position ---
+        new_position.symbol = self.symbol 
+        # --- END NEW ---
         new_position.id, new_position.entry_time, new_position.entry_regime = result['trade_id'], self.clock.time(), self.trend_regime # Use precise clock time for entry
         stop_distance = atr * self.config.ATR_INITIAL_STOP_MULTIPLIER if (atr > 0 and pd.notna(atr)) else entry_price * 0.01 # Fallback stop distance
         new_position.kelly_risk_usd, new_position.atr_risk_usd = entry_price * new_position.amount, stop_distance * new_position.amount
         self.open_positions.append(new_position)
 
-        # Keep existing detailed trade open log, now includes timestamp implicitly via current_time_str
         if not self.silent:
             initial_stop_price = (entry_price - stop_distance) if new_position.is_long else (entry_price + stop_distance)
-            # --- MODIFIED: Use current_time_str ---
             default_logger.info(f"\n{current_time_str} - [TRADE OPEN] | {direction} @ {entry_price:,.2f}\n  - Position ID:    {new_position.id}\n  - Entry Regime:   {new_position.entry_regime}\n  - Risk Profile:\n    - Position Value (Kelly Risk): ${new_position.kelly_risk_usd:,.2f}\n    - Stop-Loss Risk (ATR Risk):  -${new_position.atr_risk_usd:,.2f}\n    - Initial Stop Price:          ${initial_stop_price:,.2f}\n  - Justification:\n    - Price ({confirmation_details['price_ok']}) -> [PASS]\n    - RSI ({confirmation_details['rsi_val']:.2f} {'>' if direction == 'LONG' else '<'} {confirmation_details['rsi_req']}) -> [{'PASS' if confirmation_details['rsi_ok'] else 'FAIL'}]\n    - MACD ({confirmation_details['macd_val']:.2f} {'> 0' if direction == 'LONG' else '< 0'}) -> [{'PASS' if confirmation_details['macd_ok'] else 'FAIL'}]\n    - Volume ({confirmation_details['volume_val']:,.2f} > {confirmation_details['volume_req']:,.2f}) -> [{'PASS' if confirmation_details['volume_ok'] else 'FAIL'}]")
-            # --- END MODIFIED ---
 
     def gradual_de_risk(self):
+        # ... (no changes in this function) ...
         current_time_str = format_time(self.clock.time()) # Get formatted time
-        risk_reduction = min(0.5, ((self.peak_capital - self.capital) / self.peak_capital) / self.config.MAX_DRAWDOWN_PERCENT) if self.peak_capital > 0 and self.config.MAX_DRAWDOWN_PERCENT > 0 else 0
+        
+        # --- MODIFIED: Use total equity for drawdown calculation ---
+        current_total_equity = self.capital + self.unrealized_pnl
+        risk_reduction = min(0.5, ((self.peak_capital - current_total_equity) / self.peak_capital) / self.config.MAX_DRAWDOWN_PERCENT) if self.peak_capital > 0 and self.config.MAX_DRAWDOWN_PERCENT > 0 else 0
+        # --- END MODIFIED ---
+        
         if risk_reduction > 0: # Only log if de-risking happens
             self.max_position_size *= (1 - risk_reduction)
             self.kelly_fraction *= (1 - risk_reduction)
@@ -264,7 +282,7 @@ class AdvancedAdaptiveGridTradingBot:
     def close_position(self, position: Position, current_price: float, reason: str):
         current_time_str = format_time(self.clock.time()) # Get formatted time
         capital_before = self.capital
-        # --- Log attempt ---
+        
         if not self.silent: default_logger.info(f"{current_time_str} - Attempting to close position {position.id} via connector. Reason: {reason}")
 
         close_result = self.connector.close_position(position)
@@ -273,42 +291,83 @@ class AdvancedAdaptiveGridTradingBot:
             return
 
         profit = close_result['pnl']
-        self.capital += profit
+        
+        # --- MODIFIED: The Agnostic Capital Update ---
+        # We check the connector's class name.
+        # If it's a 'DummyConnector', we are in a backtest and must update capital ourselves.
+        # If it's any other (live) connector, we do *not* update capital,
+        # as we will wait for the 'update_live_equity' sync.
+        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
+        if is_backtest:
+            self.capital += profit
+        # --- END MODIFIED ---
+        
         profit_percent = (profit / (position.entry_price * position.amount)) * 100 if position.entry_price * position.amount != 0 else 0
         self.trade_history.append(TradeLog(entry_price=position.entry_price, close_price=close_result['close_price'], entry_time=position.entry_time, close_time=self.clock.time(), pnl_percent=profit_percent, pnl_cash=profit, reason=reason, direction='LONG' if position.is_long else 'SHORT', size=position.amount, kelly_risk_usd=position.kelly_risk_usd, atr_risk_usd=position.atr_risk_usd, entry_regime=position.entry_regime))
         if position in self.open_positions: self.open_positions.remove(position)
 
-        # Keep existing detailed trade close log, now includes timestamp implicitly via current_time_str
         if not self.silent:
             duration_s = self.clock.time() - position.entry_time
-            duration_str = time.strftime('%Hh %Mm %Ss', time.gmtime(duration_s)) if duration_s >=0 else "N/A" # Handle potential edge cases
+            duration_str = time.strftime('%Hh %Mm %Ss', time.gmtime(duration_s)) if duration_s >=0 else "N/A"
             gross_pnl = profit + close_result.get('commission', 0)
-            # --- MODIFIED: Use current_time_str ---
-            default_logger.info(f"\n{current_time_str} - [TRADE CLOSE] | {'LONG' if position.is_long else 'SHORT'} | Reason: {reason}\n  - Position ID:      {position.id}\n  - Duration:         {duration_str}\n  - Entry Price:      {position.entry_price:,.2f}\n  - Close Price:      {close_result['close_price']:,.2f}\n  - Gross PnL:        ${gross_pnl:,.2f}\n  - Commission Paid:  -${close_result.get('commission', 0):,.2f}\n  - Net PnL:          ${profit:,.2f} ({profit_percent:.2f}%)\n  - Portfolio Impact: Capital ${capital_before:,.2f} -> ${self.capital:,.2f}")
+            
+            # --- MODIFIED: Agnostic Log Message ---
+            capital_update_log = ""
+            if is_backtest:
+                capital_update_log = f"${self.capital:,.2f}" # Show new capital
+            else:
+                capital_update_log = "(Waiting for next sync...)" # Show pending sync
+                
+            default_logger.info(f"\n{current_time_str} - [TRADE CLOSE] | {'LONG' if position.is_long else 'SHORT'} | Reason: {reason}\n"
+                                f"  - Position ID:      {position.id}\n"
+                                f"  - Duration:         {duration_str}\n"
+                                f"  - Entry Price:      {position.entry_price:,.2f}\n"
+                                f"  - Close Price:      {close_result['close_price']:,.2f}\n"
+                                f"  - Gross PnL:        ${gross_pnl:,.2f}\n"
+                                f"  - Commission Paid:  -${close_result.get('commission', 0):,.2f}\n"
+                                f"  - Net PnL:          ${profit:,.2f} ({profit_percent:.2f}%)\n"
+                                f"  - Portfolio Impact: Capital ${capital_before:,.2f} -> {capital_update_log}")
             # --- END MODIFIED ---
 
-    # --- MODIFIED: Added return_details flag ---
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:
         if price <= 0:
             details_str = "Pos Size Calc: Price <= 0, returning 0.0"
             return (0.0, details_str) if return_details else 0.0
 
-        # --- MODIFIED: New Effective Capital Calculation ---
-        unrealized_pnl = 0.0
-        if self.clock.current_price > 0:
-            for pos in self.open_positions:
-                pnl = pos.calculate_profit(self.clock.current_price)
-                if pnl < 0: # Only sum unrealized losses
-                    unrealized_pnl += pnl
-        
-        # Base capital is realized capital + paper losses
-        effective_capital_base = self.capital + unrealized_pnl
-        
-        # Effective capital is the minimum of the "marked-to-loss" capital and the all-time peak
-        effective_capital = min(effective_capital_base, self.peak_capital)
+        # --- MODIFIED: Agnostic Capital Calculation ---
+        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
+        effective_capital_base = 0.0
+        details_log_header = ""
+
+        if is_backtest:
+            # In backtest, we are the "master" and must calculate our own UPL.
+            unrealized_pnl = 0.0
+            if self.clock.current_price > 0:
+                for pos in self.open_positions:
+                    # Use the *current* tick price to mark-to-market
+                    pnl = pos.calculate_profit(self.clock.current_price) 
+                    if pnl < 0: # Only sum unrealized losses
+                        unrealized_pnl += pnl
+            
+            effective_capital_base = self.capital + unrealized_pnl
+            effective_capital = min(effective_capital_base, self.peak_capital)
+            
+            # Note: peak_capital is correctly updated in the backtest by update_strategy_on_30m
+            
+            details_log_header = (f"Pos Size Calc (Backtest): RealizedCap={self.capital:,.2f}, Calc'd UPL={unrealized_pnl:,.2f} -> "
+                                  f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> ")
+
+        else:
+            # In live mode, we are a "slave" and use the synced values.
+            # 'self.capital', 'self.unrealized_pnl', 'self.peak_capital' are set by the master sync.
+            effective_capital_base = self.capital + self.unrealized_pnl
+            effective_capital = min(effective_capital_base, self.peak_capital)
+            
+            details_log_header = (f"Pos Size Calc (Live): SyncedRealizedCap={self.capital:,.2f}, SyncedUPL={self.unrealized_pnl:,.2f} -> "
+                                  f"EffCapBase={effective_capital_base:,.2f}, SyncedPeakCap={self.peak_capital:,.2f} -> ")
+
         effective_capital = max(0.0, effective_capital) # Ensure it's not negative
         # --- END MODIFIED ---
-
 
         # Calculate max value based on percentage limits
         max_value_limit = effective_capital * self.max_position_size
@@ -316,37 +375,30 @@ class AdvancedAdaptiveGridTradingBot:
         kelly_value = effective_capital * self.kelly_fraction
 
         # Final position value is the minimum of the two constraints
-        final_pos_value = min(max_value_limit * self.kelly_fraction, kelly_value) # Apply kelly to max size limit as well? Or just min(max_value_limit, kelly_value)? Let's assume min(max_limit, kelly).
         final_pos_value = min(effective_capital * self.max_position_size, effective_capital * self.kelly_fraction)
 
-
-        # --- NEW: Apply Degrading Sizing Logic ---
+        # Apply Degrading Sizing Logic
         base_amount = final_pos_value / price if price > 0 else 0.0
         
-        # Get the number of trades already open *in this grid set*
-        # This counter is reset to 0 every time the grid is rebuilt
         trade_count_in_set = self.trades_since_grid_rebuild 
         
-        # Apply the degrading factor (e.g., 1.0^0, 0.75^1, 0.75^2, ...)
         degrading_multiplier = pow(self.position_degrading_factor, trade_count_in_set)
         
         final_amount = base_amount * degrading_multiplier
-        # --- END NEW ---
         
-
-        # --- MODIFIED: Updated details string ---
-        details_str = (f"Pos Size Calc: RealizedCap={self.capital:,.2f}, UPLosses={unrealized_pnl:,.2f} -> "
-                       f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> "
+        # --- MODIFIED: Use the agnostic header string ---
+        details_str = (f"{details_log_header}"
                        f"EffCapital={effective_capital:,.2f}, MaxPosVal={max_value_limit:,.2f}, KellyPosVal={kelly_value:,.2f} "
                        f"(MaxSz={self.max_position_size:.3f}, KellyFrac={self.kelly_fraction:.3f}) "
                        f"-> FinalVal={final_pos_value:,.2f} -> BaseAmount={base_amount:.5f}\n"
                        f"             -> Degrading: Factor={self.position_degrading_factor}, TradeCountInSet={trade_count_in_set} -> Multiplier={degrading_multiplier:.4f}\n"
                        f"             -> Final Amount={final_amount:.5f}")
+        # --- END MODIFIED ---
 
         return (final_amount, details_str) if return_details else final_amount
-    # --- END MODIFIED ---
 
     def update_kelly_fraction(self):
+        # ... (no changes in this function) ...
         if len(self.trade_history) < self.config.KELLY_LOOKBACK: return
         recent_pnls = [t.pnl_percent / 100 for t in self.trade_history[-self.config.KELLY_LOOKBACK:]]
         wins = [p for p in recent_pnls if p > 0]
@@ -357,42 +409,36 @@ class AdvancedAdaptiveGridTradingBot:
         losses = [p for p in recent_pnls if p <= 0]
         avg_loss = abs(np.mean(losses)) if losses else 0.00001 # Avoid division by zero, use small number if no losses
 
-        # Calculate Win/Loss Ratio
         win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win / 0.00001 # Handle zero avg loss
 
-        # Calculate Kelly fraction (simplified: W - (1-W)/R)
         kelly_raw = win_rate - (1 - win_rate) / win_loss_ratio if win_loss_ratio > 0 else 0.0
         old_kelly = self.kelly_fraction
-        # Apply bounds and configuration fraction
         self.kelly_fraction = max(self.config.KELLY_MIN_FRACTION, min(kelly_raw, self.config.KELLY_FRACTION)) # Cap at configured max, ensure min
-        # Log if Kelly changed significantly
-        # if abs(self.kelly_fraction - old_kelly) > 0.01 and not self.silent:
-        #     default_logger.info(f"{format_time(self.clock.time())} - Kelly fraction updated: {old_kelly:.3f} -> {self.kelly_fraction:.3f} (WR={win_rate:.2f}, W/L Ratio={win_loss_ratio:.2f})")
-
 
     def log_performance(self, print_log: bool = False, logger=None) -> dict:
+        # ... (no changes in this function) ...
         if logger is None: logger = default_logger
+        
+        # --- MODIFIED: PnL is based on synced capital ---
         pnl_cash = self.capital - self.initial_capital
+        # --- END MODIFIED ---
+        
         total_return_pct = (pnl_cash / self.initial_capital) * 100 if self.initial_capital > 0 else 0
         metrics = {"total_return_pct": total_return_pct, "pnl_cash": pnl_cash, "max_drawdown": self.max_drawdown, "sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "win_rate": 0, "profit_factor": 0, "total_trades": len(self.trade_history), "regime_performance": {},
-                   # --- NEW: Grid Metrics ---
                    "total_grids_built": self.total_grids_built,
                    "total_grids_traded": self.total_grids_traded,
                    "grid_hit_rate": (self.total_grids_traded / self.total_grids_built * 100) if self.total_grids_built > 0 else 0
-                   # --- END NEW ---
                    }
         if len(self.trade_history) > 1:
             metrics['win_rate'] = sum(1 for t in self.trade_history if t.pnl_cash > 0) / len(self.trade_history) * 100
             gross_profit = sum(t.pnl_cash for t in self.trade_history if t.pnl_cash > 0) or 1
             gross_loss = abs(sum(t.pnl_cash for t in self.trade_history if t.pnl_cash < 0)) or 1
             metrics['profit_factor'] = gross_profit / gross_loss
-            # Calculate daily returns for Sharpe/Sortino (approximate using trade close times)
             if self.trade_history:
                  trade_df = pd.DataFrame([vars(t) for t in self.trade_history])
                  trade_df['close_datetime'] = pd.to_datetime(trade_df['close_time'], unit='s')
                  trade_df['daily_return'] = trade_df['pnl_percent'] / 100
                  daily_returns = trade_df.set_index('close_datetime')['daily_return'].resample('D').sum() # Sum returns per day
-                 # Ensure we have enough days for std dev calculation
                  if len(daily_returns) > 1:
                      avg_daily_return = daily_returns.mean()
                      std_daily_return = daily_returns.std()
@@ -428,15 +474,18 @@ class AdvancedAdaptiveGridTradingBot:
         avg_pos_value = np.mean([t.kelly_risk_usd for t in self.trade_history]) if self.trade_history else 0
         open_longs, open_shorts = sum(1 for p in self.open_positions if p.is_long), sum(1 for p in self.open_positions if not p.is_long)
 
-        # --- MODIFIED: Add Timestamp to Header ---
+        # --- MODIFIED: Agnostic Log Header ---
+        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
+        capital_source = "(Backtest)" if is_backtest else "(Synced from exchange)"
+        # --- END MODIFIED ---
+
         log_msg = (f"\n{'='*20} PORTFOLIO STATUS | {format_time(self.clock.time())} {'='*20}\n" # Use formatted time
-                   # (Keep existing Core, Risk, Trade Stats...)
                    f"  Core Metrics:\n"
                    f"    - Total Return:    {metrics['total_return_pct']:,.2f}%\n"
                    f"    - PnL:             ${metrics['pnl_cash']:,.2f}\n"
-                   f"    - Current Capital: ${self.capital:,.2f}\n"
+                   f"    - Current Capital: ${self.capital:,.2f} {capital_source}\n"
                    f"  Risk & Performance:\n"
-                   f"    - Peak Capital:    ${self.peak_capital:,.2f}\n"
+                   f"    - Peak Capital:    ${self.peak_capital:,.2f} {capital_source}\n"
                    f"    - Max Drawdown:    -{metrics['max_drawdown']:.2f}%\n"
                    f"    - Sharpe Ratio:    {metrics['sharpe_ratio']:.2f} (Daily Approx.)\n"
                    f"    - Sortino Ratio:   {metrics['sortino_ratio']:.2f} (Daily Approx.)\n"
@@ -447,18 +496,16 @@ class AdvancedAdaptiveGridTradingBot:
                    f"    - Profit Factor:   {metrics.get('profit_factor', 0):.2f}\n"
                    f"    - Avg Winner ($):  ${avg_winner_usd:,.2f}\n"
                    f"    - Avg Loser ($):   ${avg_loser_usd:,.2f}\n"
-                   # --- NEW: Grid Stats Section ---
                    f"  Grid Stats:\n"
                    f"    - Total Grids Built: {metrics['total_grids_built']}\n"
                    f"    - Total Grids Traded:{metrics['total_grids_traded']}\n"
                    f"    - Hit Rate:          {metrics['grid_hit_rate']:.2f}%\n"
-                   # --- END NEW ---
                    f"  Risk Stats (Average Per Trade):\n"
                    f"    - Avg Position Value: ${avg_pos_value:,.2f}\n"
                    f"  Current State:\n"
                    f"    - Open Positions:  {len(self.open_positions)} ({open_longs} L, {open_shorts} S)\n"
                    f"    - Trend/Regime:    {self.trend_regime}\n"
-                   f"    - Kelly Fraction:  {self.kelly_fraction:.3f}\n") # Increased precision for Kelly
+                   f"    - Kelly Fraction:  {self.kelly_fraction:.3f}\n")
 
         if metrics["regime_performance"]:
             log_msg += f"  {'='*20} Regime Performance Breakdown {'='*21}\n"

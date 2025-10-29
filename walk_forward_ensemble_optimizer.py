@@ -147,7 +147,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             total_trades = perf.get("total_trades", 0)
             
             # --- Quality Filter ---
-            if sortino > 0.5 and total_trades > 20:
+            if sortino > 1 and total_trades > 20:
                 completed_trials.append(t)
 
     opt_logger.info(f"Optimization complete. Found {len(completed_trials)} high-quality trials (Sortino > 0.5, Trades > 20).")
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     # --- MODIFIED: Set ONE high trial count and a cluster count ---
     # We run ONE study per walk, so n_trials should be high.
     trials_per_optimization_walk = 200 # <-- Run a large number of trials
-    number_of_bots_to_cluster = 8    # <-- Select 8 diverse bots
+    number_of_bots_to_cluster = 4    # <-- Select 8 diverse bots
     # --- END MODIFIED ---
 
     main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (with K-Means Clustering) ---")
