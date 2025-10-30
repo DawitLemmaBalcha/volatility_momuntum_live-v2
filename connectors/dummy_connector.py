@@ -6,7 +6,8 @@ from core_types import SimulationClock, Tick, Position
 
 class DummyConnector(ABC):
     """A simulated connector for backtesting purposes."""
-    SLIPPAGE_PERCENT = 0.0005
+    # --- MODIFIED: Renamed and set to your trusted value ---
+    SLIPPAGE_MULTIPLIER = 0.001
     
     def __init__(self, clock: SimulationClock, params: dict):
         self.clock, self.params, self._trade_id_counter = clock, params, 0
@@ -22,12 +23,14 @@ class DummyConnector(ABC):
     def place_order(self, symbol: str, side: str, order_type: str, qty: float, price: float = None, stop_loss: float = None) -> Dict[str, Any]:
         self._trade_id_counter += 1
         base_entry_price = price if price is not None else self.clock.current_price
-        slipped_entry_price = base_entry_price * (1 + self.SLIPPAGE_PERCENT) if side == 'buy' else base_entry_price * (1 - self.SLIPPAGE_PERCENT)
+        # --- MODIFIED: Using new variable name ---
+        slipped_entry_price = base_entry_price * (1 + self.SLIPPAGE_MULTIPLIER) if side == 'buy' else base_entry_price * (1 - self.SLIPPAGE_MULTIPLIER)
         return {"success": True, "trade_id": f"dummy_{self._trade_id_counter}", "entry_price": slipped_entry_price}
 
     def close_position(self, position: Position) -> Dict[str, Any]:
         base_close_price = self.clock.current_price
-        slipped_close_price = base_close_price * (1 - self.SLIPPAGE_PERCENT) if position.is_long else base_close_price * (1 + self.SLIPPAGE_PERCENT)
+        # --- MODIFIED: Using new variable name ---
+        slipped_close_price = base_close_price * (1 - self.SLIPPAGE_MULTIPLIER) if position.is_long else base_close_price * (1 + self.SLIPPAGE_MULTIPLIER)
         gross_pnl = (slipped_close_price - position.entry_price) * position.amount if position.is_long else (position.entry_price - slipped_close_price) * position.amount
         
         # Using a fixed fee for the dummy connector for simplicity
