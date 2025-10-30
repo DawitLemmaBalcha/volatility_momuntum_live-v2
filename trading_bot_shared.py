@@ -20,11 +20,9 @@ class AdvancedAdaptiveGridTradingBot:
     def __init__(self, initial_capital: float, simulation_clock: SimulationClock, config_module, connector: BaseConnector, silent: bool = False):
         self.config = config_module
         
-        # --- MODIFIED: These are now just the STARTING values ---
         self.initial_capital = initial_capital
-        self.capital = initial_capital      # This is now the "realized" capital
-        self.peak_capital = initial_capital # This will be synced from the master
-        # --- END MODIFIED ---
+        self.capital = initial_capital      # This will be GLOBAL realized capital
+        self.peak_capital = initial_capital # This will be GLOBAL equity peak
         
         self.clock = simulation_clock
         self.connector = connector
@@ -43,17 +41,18 @@ class AdvancedAdaptiveGridTradingBot:
         self.total_grids_built = 0
         self.total_grids_traded = 0
         
-        # --- NEW: Store unrealized PnL from the master ---
-        self.unrealized_pnl = 0.0
-        # --- END NEW ---
+        self.unrealized_pnl = 0.0 # This will be GLOBAL UPL
         
-        # --- *** NEW: CAPITAL ALLOCATION FACTOR *** ---
-        # This is the (e.g., 0.25) "slice" of the total portfolio this bot is
-        # allowed to use for *sizing* calculations.
         self.capital_allocation = 1.0
+        
+        # --- *** NEW (Request 2): For Realized Drawdown *** ---
+        # These will be injected by the master SimulationEngine
+        self.realized_equity_curve = [initial_capital]
         # --- *** END NEW *** ---
 
+
     def update_strategy_on_30m(self, data_row: dict):
+        # ... (This logic is correct for Model C, as peak/drawdown are handled by the 1-min sync) ...
         old_trend_regime = self.trend_regime
         self.trend_regime = self._get_trend_regime(data_row)
         rebuild_reason = None
@@ -62,32 +61,9 @@ class AdvancedAdaptiveGridTradingBot:
         if rebuild_reason: self.setup_asymmetric_grid(rebuild_reason, data_row)
         self.update_kelly_fraction()
         
-        # --- MODIFIED: Agnostic Capital/Drawdown Check ---
-        # --- This logic is NOW driven by the externally synced values ---
-        # (No change needed here, as self.capital, self.unrealized_pnl, 
-        # and self.peak_capital are injected by the master sync)
-        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
-        current_total_equity = 0.0
-
-        if is_backtest and self.capital_allocation == 1.0: # i.e. running in a *non-shared* backtest
-            # In (Model A) backtest, we are the "master" and must calculate our own UPL and peak equity
-            unrealized_pnl = 0.0
-            if self.clock.current_price > 0:
-                for pos in self.open_positions:
-                    unrealized_pnl += pos.calculate_profit(data_row.get('close', self.clock.current_price))
-
-            current_total_equity = self.capital + unrealized_pnl
-            if current_total_equity > self.peak_capital:
-                self.peak_capital = current_total_equity
-            
-            current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
-        
-        else:
-            # In (Model C) backtest OR live mode, we are a "slave" and use the synced values
-            current_total_equity = self.capital + self.unrealized_pnl # These are GLOBAL values
-            # 'self.peak_capital' is updated by the 'update_live_equity' master sync
-            current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
-        # --- END MODIFIED ---
+        # We still calculate max_drawdown here, using the *synced* values
+        current_total_equity = self.capital + self.unrealized_pnl
+        current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
         
         self.max_drawdown = max(self.max_drawdown, current_drawdown)
         if current_drawdown > self.config.MAX_DRAWDOWN_PERCENT: self.gradual_de_risk()
@@ -118,7 +94,7 @@ class AdvancedAdaptiveGridTradingBot:
         current_time_str = format_time(current_time)
         if current_time - self.last_grid_setup_time < self.config.GRID_SETUP_COOLDOWN_SECONDS: return
         current_price = data_row['close']
-        self.grid_orders.clear() # Clear before calculating new ones
+        self.grid_orders.clear() 
         
         self.trades_since_grid_rebuild = 0
         
@@ -134,7 +110,7 @@ class AdvancedAdaptiveGridTradingBot:
         elif "down" in self.trend_regime: lower_grids, upper_grids = int(round(total_grids * ratio_normal)), total_grids - int(round(total_grids * ratio_normal))
         else: upper_grids, lower_grids = total_grids // 2, total_grids - (total_grids // 2)
 
-        new_grid_orders = [] # Build temporary list first for logging
+        new_grid_orders = [] 
         for i in range(1, upper_grids + 1):
             price = current_price * (1 + i * self.grid_size)
             new_order = Order(price, "buy")
@@ -148,8 +124,8 @@ class AdvancedAdaptiveGridTradingBot:
             if not self.silent:
                 default_logger.info(f"{current_time_str} - Created internal grid level: sell @ stop {new_order.price:,.2f}")
 
-        self.grid_orders = new_grid_orders # Assign the fully built list
-        if self.grid_orders: # Only count if grids were actually created
+        self.grid_orders = new_grid_orders 
+        if self.grid_orders: 
             self.total_grids_built += len(self.grid_orders)
 
         if not self.silent:
@@ -158,31 +134,10 @@ class AdvancedAdaptiveGridTradingBot:
             default_logger.info(f"\n{current_time_str} - [GRID REBUILT] Reason: {reason}\n  - Center Price:    {current_price:,.2f}\n  - Trend/Regime:    {self.trend_regime}\n  - Grid Size:       {self.grid_size:.3%} (was {old_grid_size:.3%})\n  - Setup:           {len(buy_grids)} Buy Grids | {len(sell_grids)} Sell Grids\n  - Buy Levels:      [ {', '.join([f'{o.price:,.2f}' for o in buy_grids])} ]\n  - Sell Levels:     [ {', '.join([f'{o.price:,.2f}' for o in sell_grids])} ]")
         self.last_grid_setup_time = current_time
 
-    # This is the old update_strategy_on_30m, which is now split.
-    # We keep it for the (Model A) backtest path.
-    def update_strategy_on_30m_DEPRECATED(self, data_row: dict):
-        # ... (no changes in this function) ...
-        old_trend_regime = self.trend_regime
-        self.trend_regime = self._get_trend_regime(data_row)
-        rebuild_reason = None
-        if self.trend_regime != old_trend_regime: rebuild_reason = f"Strategy Shift to {self.trend_regime}"
-        elif not self.open_positions and self.clock.time() - self.last_grid_setup_time > getattr(self.config, 'GRID_MAX_LIFESPAN_SECONDS', 14400): rebuild_reason = "Grid Lifespan Expired"
-        if rebuild_reason: self.setup_asymmetric_grid(rebuild_reason, data_row)
-        self.update_kelly_fraction()
-        
-        # --- MODIFIED: Capital and peak are now managed by update_live_equity() ---
-        # We still calculate drawdown, but based on the synced values.
-        current_total_equity = self.capital + self.unrealized_pnl
-        current_drawdown = (self.peak_capital - current_total_equity) / self.peak_capital * 100 if self.peak_capital > 0 else 0
-        # --- END MODIFIED ---
-        
-        self.max_drawdown = max(self.max_drawdown, current_drawdown)
-        if current_drawdown > self.config.MAX_DRAWDOWN_PERCENT: self.gradual_de_risk()
-
     def check_exits_on_1m(self, current_price: float, atr: float):
         # ... (no changes in this function) ...
         current_time = self.clock.time()
-        current_time_str = format_time(current_time) # Get formatted time once
+        current_time_str = format_time(current_time) 
         for position in self.open_positions[:]:
             if current_time - position.entry_time > getattr(self.config, 'MAX_POSITION_DURATION_SECONDS', 86400):
                 if not self.silent: default_logger.info(f"{current_time_str} - Triggering Time Stop for position {position.id}")
@@ -237,12 +192,10 @@ class AdvancedAdaptiveGridTradingBot:
                     }
                     
                     self.execute_trade(order, size, details, atr)
-                    self.grid_orders.remove(order) # Remove after execution attempt
+                    self.grid_orders.remove(order) 
 
     def execute_trade(self, order: Order, amount: float, confirmation_details: dict, atr: float):
-        # ... (function logic is the same) ...
-        # ... BUT, the `self.capital` it reads in `close_position` will be the synced one.
-        
+        # ... (no changes in this function) ...
         current_time_str = format_time(self.clock.time()) 
         
         if len(self.open_positions) >= self.config.MAX_POSITIONS or amount <= 0: 
@@ -263,11 +216,9 @@ class AdvancedAdaptiveGridTradingBot:
 
         entry_price = result['entry_price']
         new_position = Position(entry_price, amount, direction == 'LONG')
-        # --- NEW: Set symbol on position ---
         new_position.symbol = self.symbol 
-        # --- END NEW ---
-        new_position.id, new_position.entry_time, new_position.entry_regime = result['trade_id'], self.clock.time(), self.trend_regime # Use precise clock time for entry
-        stop_distance = atr * self.config.ATR_INITIAL_STOP_MULTIPLIER if (atr > 0 and pd.notna(atr)) else entry_price * 0.01 # Fallback stop distance
+        new_position.id, new_position.entry_time, new_position.entry_regime = result['trade_id'], self.clock.time(), self.trend_regime 
+        stop_distance = atr * self.config.ATR_INITIAL_STOP_MULTIPLIER if (atr > 0 and pd.notna(atr)) else entry_price * 0.01 
         new_position.kelly_risk_usd, new_position.atr_risk_usd = entry_price * new_position.amount, stop_distance * new_position.amount
         self.open_positions.append(new_position)
 
@@ -277,21 +228,18 @@ class AdvancedAdaptiveGridTradingBot:
 
     def gradual_de_risk(self):
         # ... (no changes in this function) ...
-        current_time_str = format_time(self.clock.time()) # Get formatted time
+        current_time_str = format_time(self.clock.time()) 
         
-        # --- MODIFIED: Use total equity for drawdown calculation ---
-        # This now uses the GLOBAL portfolio equity, injected from the master
         current_total_equity = self.capital + self.unrealized_pnl
         risk_reduction = min(0.5, ((self.peak_capital - current_total_equity) / self.peak_capital) / self.config.MAX_DRAWDOWN_PERCENT) if self.peak_capital > 0 and self.config.MAX_DRAWDOWN_PERCENT > 0 else 0
-        # --- END MODIFIED ---
         
-        if risk_reduction > 0: # Only log if de-risking happens
+        if risk_reduction > 0: 
             self.max_position_size *= (1 - risk_reduction)
             self.kelly_fraction *= (1 - risk_reduction)
             if not self.silent: default_logger.info(f"{current_time_str} - De-risking due to drawdown. New max size: {self.max_position_size:.2%}, New Kelly: {self.kelly_fraction:.2f}")
 
     def close_position(self, position: Position, current_price: float, reason: str):
-        current_time_str = format_time(self.clock.time()) # Get formatted time
+        current_time_str = format_time(self.clock.time()) 
         capital_before = self.capital
         
         if not self.silent: default_logger.info(f"{current_time_str} - Attempting to close position {position.id} via connector. Reason: {reason}")
@@ -303,19 +251,12 @@ class AdvancedAdaptiveGridTradingBot:
 
         profit = close_result['pnl']
         
-        # --- MODIFIED: The Agnostic Capital Update ---
         is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
-        
-        # --- *** NEW: Check for SHARED backtest *** ---
-        # If we are in a shared (Model C) backtest, self.capital is a GLOBAL
-        # value that is READ-ONLY. The master SimulationEngine is responsible
-        # for updating it.
-        # We only update self.capital ourselves if we are in a (Model A) backtest.
         is_model_a_backtest = is_backtest and self.capital_allocation == 1.0
         
         if is_model_a_backtest:
+            # This should not be called in Model C, but we leave it for safety
             self.capital += profit
-        # --- *** END NEW *** ---
         
         profit_percent = (profit / (position.entry_price * position.amount)) * 100 if position.entry_price * position.amount != 0 else 0
         self.trade_history.append(TradeLog(entry_price=position.entry_price, close_price=close_result['close_price'], entry_time=position.entry_time, close_time=self.clock.time(), pnl_percent=profit_percent, pnl_cash=profit, reason=reason, direction='LONG' if position.is_long else 'SHORT', size=position.amount, kelly_risk_usd=position.kelly_risk_usd, atr_risk_usd=position.atr_risk_usd, entry_regime=position.entry_regime))
@@ -326,12 +267,11 @@ class AdvancedAdaptiveGridTradingBot:
             duration_str = time.strftime('%Hh %Mm %Ss', time.gmtime(duration_s)) if duration_s >=0 else "N/A"
             gross_pnl = profit + close_result.get('commission', 0)
             
-            # --- MODIFIED: Agnostic Log Message ---
             capital_update_log = ""
             if is_model_a_backtest:
-                capital_update_log = f"${self.capital:,.2f}" # Show new capital
+                capital_update_log = f"${self.capital:,.2f}" 
             else:
-                capital_update_log = "(Waiting for next sync...)" # Show pending sync
+                capital_update_log = "(Waiting for next sync...)" 
                 
             default_logger.info(f"\n{current_time_str} - [TRADE CLOSE] | {'LONG' if position.is_long else 'SHORT'} | Reason: {reason}\n"
                                 f"  - Position ID:      {position.id}\n"
@@ -342,30 +282,25 @@ class AdvancedAdaptiveGridTradingBot:
                                 f"  - Commission Paid:  -${close_result.get('commission', 0):,.2f}\n"
                                 f"  - Net PnL:          ${profit:,.2f} ({profit_percent:.2f}%)\n"
                                 f"  - Portfolio Impact: Capital ${capital_before:,.2f} -> {capital_update_log}")
-            # --- END MODIFIED ---
 
     def calculate_position_size(self, price: float, return_details: bool = False) -> float | Tuple[float, str]:
+        # ... (no changes in this function) ...
         if price <= 0:
             details_str = "Pos Size Calc: Price <= 0, returning 0.0"
             return (0.0, details_str) if return_details else 0.0
 
-        # --- MODIFIED: Agnostic Capital Calculation ---
         is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
         effective_capital_base = 0.0
         details_log_header = ""
 
-        # --- *** NEW: Check for SHARED backtest *** ---
-        # If allocation is not 1.0, we are in a shared (Model C) backtest
-        # and MUST use the "live" logic path.
         is_model_a_backtest = is_backtest and self.capital_allocation == 1.0
         
         if is_model_a_backtest:
-            # In (Model A) backtest, we are the "master" and must calculate our own UPL.
             unrealized_pnl = 0.0
             if self.clock.current_price > 0:
                 for pos in self.open_positions:
                     pnl = pos.calculate_profit(self.clock.current_price) 
-                    if pnl < 0: # Only sum unrealized losses
+                    if pnl < 0: 
                         unrealized_pnl += pnl
             
             effective_capital_base = self.capital + unrealized_pnl
@@ -373,31 +308,20 @@ class AdvancedAdaptiveGridTradingBot:
             details_log_header = (f"Pos Size Calc (Model A): RealizedCap={self.capital:,.2f}, Calc'd UPL={unrealized_pnl:,.2f} -> "
                                   f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> ")
         else:
-            # In (Model C) backtest OR live mode, we are a "slave" and use the synced values.
-            # 'self.capital', 'self.unrealized_pnl', 'self.peak_capital' are GLOBAL values.
             effective_capital_base = self.capital + self.unrealized_pnl
             effective_capital = min(effective_capital_base, self.peak_capital)
             
             details_log_header = (f"Pos Size Calc (Model C/Live): SyncedTotalRealized={self.capital:,.2f}, SyncedTotalUPL={self.unrealized_pnl:,.2f} -> "
                                   f"EffCapBase={effective_capital_base:,.2f}, SyncedTotalPeak={self.peak_capital:,.2f} -> ")
 
-        effective_capital = max(0.0, effective_capital) # Ensure it's not negative
-        # --- END MODIFIED ---
+        effective_capital = max(0.0, effective_capital) 
         
-        # --- *** NEW: Apply Capital Allocation *** ---
-        # This is the key to Model C. We size based on our "slice" of the total portfolio.
         allocated_capital_for_sizing = effective_capital * self.capital_allocation
-        # --- *** END NEW *** ---
 
-        # Calculate max value based on percentage limits
         max_value_limit = allocated_capital_for_sizing * self.max_position_size
-        # Calculate Kelly value
         kelly_value = allocated_capital_for_sizing * self.kelly_fraction
-
-        # Final position value is the minimum of the two constraints
         final_pos_value = min(max_value_limit, kelly_value)
 
-        # Apply Degrading Sizing Logic
         base_amount = final_pos_value / price if price > 0 else 0.0
         
         trade_count_in_set = self.trades_since_grid_rebuild 
@@ -406,14 +330,12 @@ class AdvancedAdaptiveGridTradingBot:
         
         final_amount = base_amount * degrading_multiplier
         
-        # --- MODIFIED: Use the agnostic header string ---
         details_str = (f"{details_log_header}"
                        f"AllocFactor={self.capital_allocation:.2f} -> AllocCapForSizing={allocated_capital_for_sizing:,.2f}\n"
                        f"             -> MaxVal={max_value_limit:,.2f}, KellyVal={kelly_value:,.2f} (MaxSz={self.max_position_size:.3f}, KellyFrac={self.kelly_fraction:.3f}) \n"
                        f"             -> FinalVal={final_pos_value:,.2f} -> BaseAmount={base_amount:.5f}\n"
                        f"             -> Degrading: Factor={self.position_degrading_factor}, TradeCountInSet={trade_count_in_set} -> Multiplier={degrading_multiplier:.4f}\n"
                        f"             -> Final Amount={final_amount:.5f}")
-        # --- END MODIFIED ---
 
         return (final_amount, details_str) if return_details else final_amount
 
@@ -423,35 +345,34 @@ class AdvancedAdaptiveGridTradingBot:
         recent_pnls = [t.pnl_percent / 100 for t in self.trade_history[-self.config.KELLY_LOOKBACK:]]
         wins = [p for p in recent_pnls if p > 0]
         if not wins:
-            self.kelly_fraction = self.config.KELLY_MIN_FRACTION; return # Set to min if no wins
+            self.kelly_fraction = self.config.KELLY_MIN_FRACTION; return 
         win_rate = len(wins) / len(recent_pnls)
         avg_win = np.mean(wins)
         losses = [p for p in recent_pnls if p <= 0]
-        avg_loss = abs(np.mean(losses)) if losses else 0.00001 # Avoid division by zero, use small number if no losses
+        avg_loss = abs(np.mean(losses)) if losses else 0.00001 
 
-        win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win / 0.00001 # Handle zero avg loss
+        win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win / 0.00001 
 
         kelly_raw = win_rate - (1 - win_rate) / win_loss_ratio if win_loss_ratio > 0 else 0.0
         old_kelly = self.kelly_fraction
-        self.kelly_fraction = max(self.config.KELLY_MIN_FRACTION, min(kelly_raw, self.config.KELLY_FRACTION)) # Cap at configured max, ensure min
+        self.kelly_fraction = max(self.config.KELLY_MIN_FRACTION, min(kelly_raw, self.config.KELLY_FRACTION)) 
 
     def log_performance(self, print_log: bool = False, logger=None) -> dict:
-        # ... (no changes in this function) ...
         if logger is None: logger = default_logger
         
-        # --- MODIFIED: PnL is based on synced capital ---
-        # This is fine, as self.capital is either the bot's own (Model A)
-        # or the *total portfolio's* (Model C). In Model C, this PnL
-        # number is for the *whole portfolio*, not this one bot.
+        # Note: In Model C, self.capital is the *total portfolio's* realized cap.
         pnl_cash = self.capital - self.initial_capital
-        # --- END MODIFIED ---
-        
         total_return_pct = (pnl_cash / self.initial_capital) * 100 if self.initial_capital > 0 else 0
+        
         metrics = {"total_return_pct": total_return_pct, "pnl_cash": pnl_cash, "max_drawdown": self.max_drawdown, "sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "win_rate": 0, "profit_factor": 0, "total_trades": len(self.trade_history), "regime_performance": {},
                    "total_grids_built": self.total_grids_built,
                    "total_grids_traded": self.total_grids_traded,
-                   "grid_hit_rate": (self.total_grids_traded / self.total_grids_built * 100) if self.total_grids_built > 0 else 0
+                   "grid_hit_rate": (self.total_grids_traded / self.total_grids_built * 100) if self.total_grids_built > 0 else 0,
+                   # --- *** NEW (Request 2): Add new metric *** ---
+                   "realized_max_drawdown": 0.0 
+                   # --- *** END NEW *** ---
                    }
+                   
         if len(self.trade_history) > 1:
             metrics['win_rate'] = sum(1 for t in self.trade_history if t.pnl_cash > 0) / len(self.trade_history) * 100
             gross_profit = sum(t.pnl_cash for t in self.trade_history if t.pnl_cash > 0) or 1
@@ -461,11 +382,11 @@ class AdvancedAdaptiveGridTradingBot:
                  trade_df = pd.DataFrame([vars(t) for t in self.trade_history])
                  trade_df['close_datetime'] = pd.to_datetime(trade_df['close_time'], unit='s')
                  trade_df['daily_return'] = trade_df['pnl_percent'] / 100
-                 daily_returns = trade_df.set_index('close_datetime')['daily_return'].resample('D').sum() # Sum returns per day
+                 daily_returns = trade_df.set_index('close_datetime')['daily_return'].resample('D').sum() 
                  if len(daily_returns) > 1:
                      avg_daily_return = daily_returns.mean()
                      std_daily_return = daily_returns.std()
-                     metrics['sharpe_ratio'] = (avg_daily_return / std_daily_return) * np.sqrt(365) if std_daily_return > 0 else 0 # Assuming 365 days
+                     metrics['sharpe_ratio'] = (avg_daily_return / std_daily_return) * np.sqrt(365) if std_daily_return > 0 else 0 
 
                      neg_daily_returns = daily_returns[daily_returns < 0]
                      downside_dev_daily = neg_daily_returns.std() if len(neg_daily_returns) > 1 else 0
@@ -475,33 +396,36 @@ class AdvancedAdaptiveGridTradingBot:
             elif total_return_pct > 0: metrics['calmar_ratio'] = 999.0
             else: metrics['calmar_ratio'] = 0.0
 
+            # --- *** NEW (Request 2): Calculate Realized Drawdown *** ---
+            # self.realized_equity_curve is injected by the master engine
+            if len(self.realized_equity_curve) > 1:
+                realized_equity_series = pd.Series(self.realized_equity_curve)
+                realized_peak_series = realized_equity_series.expanding().max()
+                realized_drawdown_series = (realized_equity_series - realized_peak_series) / realized_peak_series
+                metrics['realized_max_drawdown'] = abs(realized_drawdown_series.min()) * 100
+            # --- *** END NEW *** ---
+
             regime_trades = defaultdict(list)
             for t in self.trade_history: regime_trades[t.entry_regime].append(t)
             for regime, trades in regime_trades.items():
-                if not trades: continue # Skip if empty
+                if not trades: continue 
                 regime_pnl = sum(t.pnl_cash for t in trades)
                 regime_wins = sum(1 for t in trades if t.pnl_cash > 0)
                 regime_gross_profit = sum(t.pnl_cash for t in trades if t.pnl_cash > 0) or 1
-                
-                # --- *** THIS IS THE FIX *** ---
                 regime_gross_loss = abs(sum(t.pnl_cash for t in trades if t.pnl_cash < 0)) or 1
-                # --- *** END FIX *** ---
-                
                 metrics["regime_performance"][regime] = {"total_trades": len(trades), "win_rate": f"{(regime_wins / len(trades)) * 100 if trades else 0:.2f}%", "profit_factor": f"{regime_gross_profit / regime_gross_loss:.2f}", "net_pnl": f"${regime_pnl:,.2f}"}
 
-        metrics["performance_log_str"] = self._get_performance_log_str(metrics) # Generate final string using all metrics
+        metrics["performance_log_str"] = self._get_performance_log_str(metrics) 
         if print_log: logger.info(metrics["performance_log_str"])
         return metrics
 
     def _get_performance_log_str(self, metrics: dict) -> str:
-        # (Existing log string generation logic...)
         winning_trades, losing_trades = [t.pnl_cash for t in self.trade_history if t.pnl_cash > 0], [t.pnl_cash for t in self.trade_history if t.pnl_cash < 0]
         wins, losses = len(winning_trades), len(losing_trades)
         avg_winner_usd, avg_loser_usd = np.mean(winning_trades) if wins > 0 else 0, np.mean(losing_trades) if losses > 0 else 0
         avg_pos_value = np.mean([t.kelly_risk_usd for t in self.trade_history]) if self.trade_history else 0
         open_longs, open_shorts = sum(1 for p in self.open_positions if p.is_long), sum(1 for p in self.open_positions if not p.is_long)
 
-        # --- MODIFIED: Agnostic Log Header ---
         is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
         
         capital_source = "(Backtest Model A)"
@@ -509,44 +433,47 @@ class AdvancedAdaptiveGridTradingBot:
             capital_source = "(Synced from exchange)"
         elif self.capital_allocation != 1.0:
             capital_source = "(Synced from Model C Engine)"
-        # --- END MODIFIED ---
 
-        log_msg = (f"\n{'='*20} PORTFOLIO STATUS | {format_time(self.clock.time())} {'='*20}\n" # Use formatted time
+        log_msg = (f"\n{'='*20} PORTFOLIO STATUS | {format_time(self.clock.time())} {'='*20}\n" 
                    f"  Core Metrics:\n"
+                   # Note: PnL and Capital are PORTFOLIO-WIDE in Model C
                    f"    - Total Return:    {metrics['total_return_pct']:,.2f}%\n"
                    f"    - PnL:             ${metrics['pnl_cash']:,.2f}\n"
                    f"    - Current Capital: ${self.capital:,.2f} {capital_source}\n"
                    f"  Risk & Performance:\n"
-                   f"    - Peak Capital:    ${self.peak_capital:,.2f} {capital_source}\n"
-                   f"    - Max Drawdown:    -{metrics['max_drawdown']:.2f}%\n"
+                   # Note: Peaks and Drawdowns are PORTFOLIO-WIDE in Model C
+                   f"    - Peak Equity:     ${self.peak_capital:,.2f} {capital_source}\n"
+                   # --- *** NEW (Request 2): Modify log string *** ---
+                   f"    - Max Equity Drawdown:   -{metrics['max_drawdown']:.2f}% (incl. UPL)\n"
+                   f"    - Max Realized Drawdown: -{metrics['realized_max_drawdown']:.2f}% (prop firm style)\n"
+                   # --- *** END NEW *** ---
                    f"    - Sharpe Ratio:    {metrics['sharpe_ratio']:.2f} (Daily Approx.)\n"
                    f"    - Sortino Ratio:   {metrics['sortino_ratio']:.2f} (Daily Approx.)\n"
                    f"    - Calmar Ratio:    {metrics['calmar_ratio']:.2f}\n"
-                   f"  Trade Stats (This Bot Only):\n" # Clarification
+                   f"  Trade Stats (This Bot Only):\n" 
                    f"    - Total Trades:    {metrics['total_trades']}\n"
                    f"    - Win Rate:        {metrics.get('win_rate', 0):.2f}% ({wins} W / {losses} L)\n"
                    f"    - Profit Factor:   {metrics.get('profit_factor', 0):.2f}\n"
                    f"    - Avg Winner ($):  ${avg_winner_usd:,.2f}\n"
                    f"    - Avg Loser ($):   ${avg_loser_usd:,.2f}\n"
-                   f"  Grid Stats (This Bot Only):\n" # Clarification
+                   f"  Grid Stats (This Bot Only):\n" 
                    f"    - Total Grids Built: {metrics['total_grids_built']}\n"
                    f"    - Total Grids Traded:{metrics['total_grids_traded']}\n"
                    f"    - Hit Rate:          {metrics['grid_hit_rate']:.2f}%\n"
-                   f"  Risk Stats (This Bot Only):\n" # Clarification
+                   f"  Risk Stats (This Bot Only):\n" 
                    f"    - Avg Position Value: ${avg_pos_value:,.2f}\n"
                    f"  Current State:\n"
                    f"    - Open Positions:  {len(self.open_positions)} ({open_longs} L, {open_shorts} S)\n"
                    f"    - Trend/Regime:    {self.trend_regime}\n"
                    f"    - Kelly Fraction:  {self.kelly_fraction:.3f}\n"
-                   f"    - Cap Allocation:  {self.capital_allocation:.2%}\n") # Added new field
+                   f"    - Cap Allocation:  {self.capital_allocation:.2%}\n") 
 
         if metrics["regime_performance"]:
-            log_msg += f"  {'='*20} Regime Performance Breakdown (This Bot Only) {'='*11}\n" # Clarification
+            log_msg += f"  {'='*20} Regime Performance Breakdown (This Bot Only) {'='*11}\n" 
             log_msg += f"  {'Regime':<25} | {'Trades':>8} | {'Win Rate':>10} | {'Profit Factor':>15} | {'Net PnL':>15}\n"
             log_msg += f"  {'-'*78}\n"
-            # Sort regimes alphabetically for consistent output
             for regime, stats in sorted(metrics["regime_performance"].items()):
                 log_msg += f"  {regime:<25} | {stats['total_trades']:>8} | {stats['win_rate']:>10} | {stats['profit_factor']:>15} | {stats['net_pnl']:>15}\n"
 
-        log_msg += f"{'='*78}" # Footer line
+        log_msg += f"{'='*78}" 
         return log_msg
