@@ -10,11 +10,11 @@ from datetime import datetime
 import config  # It still reads the same base config.py for dates/symbols
 
 # --- *** ADDED THIS MISSING IMPORT *** ---
-from data_fetcher import fetch_all_dataframes
+from simulation.data_fetcher import fetch_all_dataframes
 # --- *** END CHANGE *** ---
 
 # --- We import from the new _shared runner, which uses the _shared bot ---
-from backtest_runner_shared import run_single_backtest
+from simulation.backtest_runner_shared import run_single_backtest
 
 
 def setup_logging():

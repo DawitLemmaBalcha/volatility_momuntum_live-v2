@@ -2,7 +2,7 @@
 
 from abc import ABC
 from typing import Dict, Any, Callable
-from core_types import SimulationClock, Tick, Position
+from core.core_types import SimulationClock, Tick, Position
 
 class DummyConnector(ABC):
     """A simulated connector for backtesting purposes."""

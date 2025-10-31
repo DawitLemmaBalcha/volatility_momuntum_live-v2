@@ -11,12 +11,12 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 import config
-from data_fetcher import fetch_all_dataframes
-from optimize import ConfigContainer  
+from simulation.data_fetcher import fetch_all_dataframes
+from analysis.optimize import ConfigContainer  
 
 # --- *** NEW: Importing from SHARED files *** ---
-from trading_bot_shared import AdvancedAdaptiveGridTradingBot
-from backtest_runner_shared import (
+from core.trading_bot_shared import AdvancedAdaptiveGridTradingBot
+from simulation.backtest_runner_shared import (
     SimulationEngine, 
     prepare_data_for_simulation, 
     run_simulation_from_prepared_data # Note: This is still Model A, which is correct for *optimization*
@@ -26,7 +26,7 @@ from backtest_runner_shared import (
 # --- *** ADDED FOR MODEL A DIAGNOSTICS *** ---
 # Import the Model A (distinct capital) runner for our diagnostic OOS tests
 try:
-    from backtest_runner import run_simulation_from_prepared_data as run_model_a_simulation
+    from simulation.backtest_runner import run_simulation_from_prepared_data as run_model_a_simulation
 except ImportError:
     print("Could not import Model A backtest_runner. Diagnostics will fail.")
     run_model_a_simulation = None
@@ -298,7 +298,7 @@ if __name__ == "__main__":
     for env_var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS']:
         os.environ[env_var] = '1'
     
-    log_filename = f"walk_forward_ensemble_SHARED_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    log_filename = f"logs/walk_forward_ensemble_SHARED_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
     main_logger = logging.getLogger('wf_ensemble_logger')
     main_logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(log_filename)
@@ -341,6 +341,6 @@ if __name__ == "__main__":
 
     if all_walks_data:
         results_df = pd.DataFrame(all_walks_data)
-        results_filename = f"walk_forward_ensemble_SHARED_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        results_filename = f"results/walk_forward_ensemble_SHARED_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         results_df.to_csv(results_filename, index=False)
         main_logger.info(f"\nSuccessfully saved all walk-forward ensemble (SHARED) data to: {results_filename}")

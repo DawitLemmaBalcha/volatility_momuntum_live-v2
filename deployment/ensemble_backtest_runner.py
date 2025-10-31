@@ -8,11 +8,11 @@ from datetime import datetime
 import importlib.util
 
 # Import the main VENUES config
-from ensemble_config import VENUES
-from data_fetcher import fetch_all_dataframes
-from backtest_runner import SimulationEngine
-from trading_bot import AdvancedAdaptiveGridTradingBot
-from core_types import SimulationClock
+from deployment.ensemble_config import VENUES
+from simulation.data_fetcher import fetch_all_dataframes
+from simulation.backtest_runner import SimulationEngine
+from core.trading_bot import AdvancedAdaptiveGridTradingBot
+from core.core_types import SimulationClock
 
 # ... (setup_logging and log_prop_firm_summary functions remain the same) ...
 def setup_logging():

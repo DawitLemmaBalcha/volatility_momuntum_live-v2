@@ -18,9 +18,9 @@ import pandas as pd
 from datetime import datetime
 import json
 import config
-from data_fetcher import fetch_all_dataframes
+from simulation.data_fetcher import fetch_all_dataframes
 # --- MODIFIED: Import new simulation functions ---
-from backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
+from simulation.backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
 
 # --- A simple, pickle-able class to hold config values ---
 class ConfigContainer:

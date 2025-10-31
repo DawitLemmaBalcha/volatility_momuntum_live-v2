@@ -5,7 +5,7 @@ import time
 from pybit.unified_trading import HTTP, WebSocket
 from .base_connector import BaseConnector
 from typing import Dict, Any, Callable
-from core_types import Tick, Position
+from core.core_types import Tick, Position
 
 class BybitDemoConnector(BaseConnector):
     """

@@ -7,7 +7,7 @@ import pandas as pd
 from typing import List, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
-from core_types import Position, Order, SimulationClock, TradeLog, Tick
+from core.core_types import Position, Order, SimulationClock, TradeLog, Tick
 from connectors.base_connector import BaseConnector
 
 default_logger = logging.getLogger(__name__)

@@ -10,10 +10,10 @@ import copy
 
 # Import necessary components from your existing project files
 import config
-from data_fetcher import fetch_all_dataframes
-from optimize import objective, ConfigContainer # Import the objective and the container
+from simulation.data_fetcher import fetch_all_dataframes
+from analysis.optimize import objective, ConfigContainer # Import the objective and the container
 # --- MODIFIED: Import new simulation functions ---
-from backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
+from simulation.backtest_runner import prepare_data_for_simulation, run_simulation_from_prepared_data
 
 # --- NEW: Global list to store results from all walks ---
 all_trials_data = []
@@ -24,7 +24,7 @@ def run_single_walk(walk_number: int, is_start: str, is_end: str, oos_end: str, 
     In-Sample (IS) optimization and Out-of-Sample (OOS) testing.
     """
     # ... (logging setup remains the same) ...
-    log_filename = f"walk_forward_log_WALK_{walk_number}.log"
+    log_filename = f"logs/walk_forward_log_WALK_{walk_number}.log"
     opt_logger = logging.getLogger(f'walk_{walk_number}_logger')
     opt_logger.setLevel(logging.INFO)
     opt_logger.propagate = False
@@ -210,7 +210,7 @@ if __name__ == "__main__":
 
     if all_trials_data:
         results_df = pd.DataFrame(all_trials_data)
-        results_filename = f"walk_forward_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        results_filename = f"results/walk_forward_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         results_df.to_csv(results_filename, index=False)
         print(f"\nSuccessfully saved all trial data to: {results_filename}")
     else:

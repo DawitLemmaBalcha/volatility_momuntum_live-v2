@@ -1,8 +1,14 @@
+# Python cache
 __pycache__/
-data/
-*.log
-*.csv
-*.parquet
 *.pyc
-/connectors/__pycache__/
+
+# Local config
+api.env
+
+# Output folders
+data/
+logs/
+results/
+
+# Dependencies
 vtwo/

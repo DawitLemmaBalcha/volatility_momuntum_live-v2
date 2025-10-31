@@ -86,7 +86,7 @@ def analyze_results(results_df, output_dir):
 
 if __name__ == '__main__':
     # Find the most recent results CSV file
-    list_of_files = glob.glob('walk_forward_results_*.csv')
+    list_of_files = glob.glob('results/walk_forward_results_*.csv')
     if not list_of_files:
         print("Error: No 'walk_forward_results_*.csv' files found. Please run the optimizer first.")
     else:

@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Callable
-from core_types import Position, Tick
+from core.core_types import Position, Tick
 
 class BaseConnector(ABC):
     """

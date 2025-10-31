@@ -11,9 +11,9 @@ from collections import deque
 from dotenv import load_dotenv
 from typing import List, Dict, Callable
 
-from ensemble_config import VENUES
-from trading_bot import AdvancedAdaptiveGridTradingBot
-from core_types import SimulationClock, Tick
+from deployment.ensemble_config import VENUES
+from core.trading_bot import AdvancedAdaptiveGridTradingBot
+from core.core_types import SimulationClock, Tick
 
 # --- The Definitive Fix ---
 dotenv_path = os.path.join(os.path.dirname(__file__), 'api.env')

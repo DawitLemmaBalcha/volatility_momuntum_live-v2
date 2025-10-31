@@ -1,52 +1,38 @@
-# backtest_runner_shared.py
+# backtest_runner.py
 
 import pandas as pd
 import numpy as np
 import pandas_ta as ta
 import logging
+# import random <-- 1. REMOVED (Original file)
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Callable, List, Optional
-# --- *** NEW: Importing shared bot *** ---
-from trading_bot_shared import AdvancedAdaptiveGridTradingBot
-# --- *** END NEW *** ---
-from core_types import SimulationClock, Tick, Position
+from core.trading_bot import AdvancedAdaptiveGridTradingBot # <-- This is the original bot
+from core.core_types import SimulationClock, Tick, Position
 import optuna 
 
 # --- NEW: Importing the standardized DummyConnector ---
 from connectors.dummy_connector import DummyConnector
 
+# --- REMOVED: The private, internal DummyConnector class was removed from here ---
+
 
 class SimulationEngine:
     """
-    Handles the time-synchronized, concurrent simulation of one or more trading bots
-    using a SHARED CAPITAL POOL (Model C).
+    Handles the time-synchronized, concurrent simulation of one or more trading bots.
+    (This is the Model A Engine)
     """
     def __init__(self, data: pd.DataFrame, bots: List[AdvancedAdaptiveGridTradingBot], logger=None, prepared: bool = False):
         self.data = data 
         self.is_prepared = prepared
+        
         self.bots = bots
         self.logger = logger or logging.getLogger(__name__)
-        
-        if not self.bots:
-            raise ValueError("SimulationEngine requires at least one bot.")
-        
-        self.initial_per_bot_capital = self.bots[0].initial_capital
-        self.initial_portfolio_capital = self.initial_per_bot_capital * len(self.bots)
-        self.master_peak_capital = self.initial_portfolio_capital # Equity peak
-        
-        self.portfolio_equity_curve = [self.initial_portfolio_capital]
-        
-        self.realized_portfolio_equity_curve = [self.initial_portfolio_capital]
-        
-        # --- *** FIX 1 of 4: Add a master variable for realized capital *** ---
-        # This is the single source of truth for the portfolio's REALIZED capital.
-        # It is only updated by the P&L from the DummyConnector.
-        self.master_realized_capital = self.initial_portfolio_capital
-        # --- *** END FIX *** ---
+        self.portfolio_equity_curve = []
+        self.initial_portfolio_capital = sum(bot.initial_capital for bot in self.bots)
 
     def _prepare_data(self):
-        # ... (This function is correct, no changes) ...
-        
+        # ... (no changes in this function) ...
         if self.is_prepared:
             return self.data 
             
@@ -63,18 +49,27 @@ class SimulationEngine:
         df_30m['macd'] = macd_30m[f'MACD_{bot_config.MACD_FAST_PERIOD}_{bot_config.MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}']
 
         bb_period = bot_config.BOLLINGER_PERIOD
-        bb_std = bot_config.BOLLINGER_STD_DEV
+        # --- *** THIS IS THE FIX *** ---
+        bb_std = bot_config.BOLLINGER_STD_DEV # (Was BOLLINGZ_STD_DEV)
+        # --- *** END FIX *** ---
+        
         bbands_30m = ta.bbands(df_30m['close'], length=bb_period, std=bb_std)
+
         bbl_col_name = None
         bbu_col_name = None
+
         patterns_to_try = [
-            f'BBL_{bb_period}_{bb_std}', f'BBL_{bb_period}_{int(bb_std)}', f'BBL_{bb_period}'
+            f'BBL_{bb_period}_{bb_std}',      
+            f'BBL_{bb_period}_{int(bb_std)}', 
+            f'BBL_{bb_period}'              
         ]
+        
         for pattern in patterns_to_try:
             if pattern in bbands_30m.columns:
                 bbl_col_name = pattern
                 bbu_col_name = pattern.replace('BBL', 'BBU') 
                 break
+        
         if bbl_col_name is None:
             try:
                 bbl_col_name = [col for col in bbands_30m.columns if col.startswith('BBL_')][0]
@@ -118,30 +113,14 @@ class SimulationEngine:
         sim_start_time = df_merged['timestamp'].iloc[0].timestamp()
         clock = SimulationClock(start_time=sim_start_time)
         
-        # --- *** FIX 2 of 4: Pass the engine instance 'self' to the connector *** ---
-        # This allows the connector to update the engine's master capital.
-        dummy_connector = DummyConnector(clock, {}, engine=self)
+        dummy_connector = DummyConnector(clock, {})
 
         first_row = df_merged.iloc[0]
+        # Set clock to first row *before* bot init
         clock.current_time = first_row['timestamp'].timestamp()
         clock.current_price = first_row['close']
         
-
         for bot in self.bots:
-            # This is the bot's own initial capital (e.g., $100,000)
-            bot.initial_capital = self.initial_per_bot_capital 
-            
-            # --- ADD THIS LINE ---
-            # This is the portfolio's initial capital (e.g., $200,000)
-            bot.portfolio_initial_capital = self.initial_portfolio_capital
-            # --- END ADD ---
-            
-            bot.capital = self.master_realized_capital 
-            bot.peak_capital = self.master_peak_capital 
-            
-            bot.realized_equity_curve = [self.initial_portfolio_capital]
-            # ... (rest of the bot setup) ...
-            
             bot.clock = clock
             bot.connector = dummy_connector
             bot.initialize_state(first_row.to_dict())
@@ -154,49 +133,33 @@ class SimulationEngine:
         for i in range(1, len(df_merged)):
             current_row, prev_row = df_merged.iloc[i], df_merged.iloc[i-1]
             
-            # --- *** FIX 3 of 4: Modify the SYNC BLOCK *** ---
-            
-            # 1. Calculate GLOBAL portfolio state
-            # --- THIS IS THE FIX ---
-            # DO NOT sum bot.capital. Use the master variable.
-            # The DummyConnector will update self.master_realized_capital directly.
-            total_realized_capital = self.master_realized_capital 
-            
-            total_unrealized_pnl = 0.0
+            # --- Equity/Peak Update (using prev_row to prevent lookahead) ---
+            prev_candle_close_price = prev_row['close']
+            current_portfolio_equity = 0.0
             for bot in self.bots:
-                for pos in bot.open_positions:
-                    total_unrealized_pnl += pos.calculate_profit(clock.current_price)
-            
-            current_total_equity = total_realized_capital + total_unrealized_pnl
-            
-            # 2. Update GLOBAL equity peak
-            self.master_peak_capital = max(self.master_peak_capital, current_total_equity)
-            self.realized_portfolio_equity_curve.append(total_realized_capital)
-
-            # 3. Inject GLOBAL state into ALL bots
-            for bot in self.bots:
-                bot.capital = total_realized_capital        
-                bot.unrealized_pnl = total_unrealized_pnl   
-                bot.peak_capital = self.master_peak_capital 
-                bot.realized_equity_curve = self.realized_portfolio_equity_curve
-            # --- *** END FIX *** ---
+                bot.update_equity_on_1m(prev_candle_close_price)
+                current_portfolio_equity += bot.capital + bot.unrealized_pnl
             
             
-            # Update 30-minute strategies
+            # Update 30-minute strategies (now uses fresh state)
             if current_row['timestamp'].floor('30min') > prev_row['timestamp'].floor('30min'):
                 for bot in self.bots:
                     bot.update_strategy_on_30m(prev_row.to_dict())
             
             o, h, l, c, v, base_ts = current_row['open'], current_row['high'], current_row['low'], current_row['close'], current_row['volume'], current_row['timestamp'].timestamp()
             
-            if c > o: key_prices = [o, l, h, c]
-            else: key_prices = [o, h, l, c]
+            if c > o:
+                key_prices = [o, l, h, c]
+            else:
+                key_prices = [o, h, l, c]
+            
             
             rsi_1m_val = current_row['rsi_1m']
             macd_1m_val = current_row['macd_1m']
             volume_ma_1m_val = current_row['volume_ma_1m']
-            atr_val = current_row['atr']
+            atr_val = current_row['atr'] 
             volume_1m_val = prev_row['volume'] 
+
 
             for price in key_prices:
                 tick = Tick(timestamp=base_ts, price=price, volume=0, candle_volume=v) 
@@ -204,29 +167,21 @@ class SimulationEngine:
                 
                 for bot in self.bots:
                     bot.check_entries_on_tick(tick, rsi_1m_val, macd_1m_val, volume_1m_val, volume_ma_1m_val, atr_val)
-                    
-                    # --- *** FIX 4 of 4: Call check_exits_on_1m *** ---
-                    # This function will call bot.close_position, which calls
-                    # the connector, which now updates self.master_realized_capital.
-                    # This completes the loop, and P&L is now correctly added.
                     bot.check_exits_on_1m(price, atr_val)
 
             
-            self.portfolio_equity_curve.append(current_total_equity)
+            self.portfolio_equity_curve.append(current_portfolio_equity)
             
+            
+            # --- Pruning Check ---
             if trial and i % 1000 == 0:
-                trial.report(current_total_equity, i) 
+                trial.report(current_portfolio_equity, i) # Report equity
                 if trial.should_prune():
                     raise optuna.TrialPruned()
 
 
         # --- Final Performance Calculation ---
         portfolio_results = self._calculate_portfolio_metrics()
-        
-        realized_equity_series = pd.Series(self.realized_portfolio_equity_curve)
-        realized_peak_series = realized_equity_series.expanding().max()
-        realized_drawdown_series = (realized_equity_series - realized_peak_series) / realized_peak_series
-        portfolio_results['realized_max_drawdown'] = abs(realized_drawdown_series.min()) * 100
         
         if trial:
             trial.report(portfolio_results['final_capital'], len(df_merged))
@@ -236,7 +191,7 @@ class SimulationEngine:
         return portfolio_results, individual_results
 
     def _calculate_portfolio_metrics(self):
-        # ... (This function is correct, no changes) ...
+        # ... (no changes in this function) ...
         equity_series = pd.Series(self.portfolio_equity_curve)
         peak = equity_series.expanding().max()
         drawdown = (equity_series - peak) / peak
@@ -255,27 +210,21 @@ class SimulationEngine:
         }
 
 # --- Wrapper functions (prepare_data, run_from_prepared, run_single) ---
-
-# --- *** FIX FOR NameError: 'bot' is not defined *** ---
-def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module, logger=None) -> pd.DataFrame:
-    if logger is None:
-        logger = logging.getLogger(__name__)
-        
-    dummy_bot = AdvancedAdaptiveGridTradingBot( 
+# ... (no changes needed in these wrapper functions) ...
+def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module) -> pd.DataFrame:
+    dummy_bot = AdvancedAdaptiveGridTradingBot(
         initial_capital=0,
         simulation_clock=SimulationClock(0),
         config_module=config_module,
         connector=None,
         silent=True
     )
-    # --- THIS WAS THE BUG: It said [bot] instead of [dummy_bot] ---
-    temp_engine = SimulationEngine(df_1m_full, [dummy_bot], logger, prepared=False) 
-    # --- END BUG FIX ---
+    temp_engine = SimulationEngine(df_1m_full, [dummy_bot], prepared=False)
     try:
         df_prepared = temp_engine._prepare_data()
         return df_prepared
     except Exception as e:
-        logger.error(f"Failed during data preparation: {e}", exc_info=True)
+        logging.getLogger(__name__).error(f"Failed during data preparation: {e}", exc_info=True)
         return pd.DataFrame() 
 
 def run_simulation_from_prepared_data(
@@ -287,29 +236,22 @@ def run_simulation_from_prepared_data(
 ):
     bot_config = config_module
     fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
-    
-    # We create a single bot for the optimization's objective function
-    bot = AdvancedAdaptiveGridTradingBot( 
+    dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
+    bot = AdvancedAdaptiveGridTradingBot(
         initial_capital=bot_config.INITIAL_CAPITAL,
         simulation_clock=SimulationClock(0), 
         config_module=bot_config,
-        connector=None, # Connector will be set by the engine
+        connector=dummy_connector,
         silent=not verbose
     )
-    
-    # We pass the bot in a list to the engine
     engine = SimulationEngine(df_prepared, [bot], logger, prepared=True)
-    
-    # The engine will create the connector and pass 'self' (the engine) to it
     portfolio_results, individual_results = engine.run(trial=trial)
-    
     final_metrics = individual_results[0] if individual_results else {}
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))
     elif not final_metrics and portfolio_results:
         return portfolio_results
     return final_metrics
-
 
 def run_single_backtest(
     df_1m_full: pd.DataFrame, 
@@ -319,18 +261,17 @@ def run_single_backtest(
     trial: Optional[optuna.trial.Trial] = None 
 ):
     bot_config = config_module
-    
-    bot = AdvancedAdaptiveGridTradingBot( 
+    fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
+    dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
+    bot = AdvancedAdaptiveGridTradingBot(
         initial_capital=bot_config.INITIAL_CAPITAL,
         simulation_clock=SimulationClock(0), 
         config_module=bot_config,
-        connector=None, # Connector will be set by the engine
+        connector=dummy_connector,
         silent=not verbose
     )
-    
     engine = SimulationEngine(df_1m_full, [bot], logger, prepared=False)
     portfolio_results, individual_results = engine.run(trial=trial)
-    
     final_metrics = individual_results[0] if individual_results else {}
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))

@@ -6,8 +6,8 @@ import pandas as pd
 import logging
 from datetime import datetime
 import config
-from data_fetcher import fetch_all_dataframes
-from backtest_runner import run_single_backtest
+from simulation.data_fetcher import fetch_all_dataframes
+from simulation.backtest_runner import run_single_backtest
 
 def setup_logging():
     """Configures logging for a standard backtest run."""

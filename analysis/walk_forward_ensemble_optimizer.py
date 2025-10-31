@@ -14,12 +14,12 @@ from sklearn.preprocessing import StandardScaler
 
 # Import necessary components from your existing project files
 import config
-from data_fetcher import fetch_all_dataframes
-from optimize import ConfigContainer  # We need the container for building bots
-from trading_bot import AdvancedAdaptiveGridTradingBot
+from simulation.data_fetcher import fetch_all_dataframes
+from analysis.optimize import ConfigContainer  # We need the container for building bots
+from core.trading_bot import AdvancedAdaptiveGridTradingBot
 
 # --- MODIFIED: Import new simulation functions ---
-from backtest_runner import (
+from simulation.backtest_runner import (
     SimulationEngine, 
     prepare_data_for_simulation, 
     run_simulation_from_prepared_data
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     for env_var in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS']:
         os.environ[env_var] = '1'
     
-    log_filename = f"walk_forward_ensemble_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    log_filename = f"logs/walk_forward_ensemble_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
     main_logger = logging.getLogger('wf_ensemble_logger')
     main_logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(log_filename)
@@ -326,6 +326,6 @@ if __name__ == "__main__":
 
     if all_walks_data:
         results_df = pd.DataFrame(all_walks_data)
-        results_filename = f"walk_forward_ensemble_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        results_filename = f"results/walk_forward_ensemble_results_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
         results_df.to_csv(results_filename, index=False)
         main_logger.info(f"\nSuccessfully saved all walk-forward ensemble data to: {results_filename}")
