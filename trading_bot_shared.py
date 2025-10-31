@@ -21,6 +21,7 @@ class AdvancedAdaptiveGridTradingBot:
         self.config = config_module
         
         self.initial_capital = initial_capital
+        self.portfolio_initial_capital = initial_capital
         self.capital = initial_capital      # This will be GLOBAL realized capital
         self.peak_capital = initial_capital # This will be GLOBAL equity peak
         
@@ -296,17 +297,21 @@ class AdvancedAdaptiveGridTradingBot:
         is_model_a_backtest = is_backtest and self.capital_allocation == 1.0
         
         if is_model_a_backtest:
-            unrealized_pnl = 0.0
-            if self.clock.current_price > 0:
-                for pos in self.open_positions:
-                    pnl = pos.calculate_profit(self.clock.current_price) 
-                    if pnl < 0: 
-                        unrealized_pnl += pnl
+            # effective_capital_base = self.capital + self.unrealized_pnl # <<< USE THE INJECTED 'self.unrealized_pnl'
+            # effective_capital = min(effective_capital_base, self.peak_capital)
+            # details_log_header = (f"Pos Size Calc (Model A): RealizedCap={self.capital:,.2f}, UPL={self.unrealized_pnl:,.2f} -> " # <<< USE 'self.unrealized_pnl'
+            #                       f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> ")
             
-            effective_capital_base = self.capital + unrealized_pnl
+            # --- EVEN BETTER, just make it use the 'else' block's logic ---
+            # which correctly uses the injected values.
+            
+            effective_capital_base = self.capital + self.unrealized_pnl
             effective_capital = min(effective_capital_base, self.peak_capital)
-            details_log_header = (f"Pos Size Calc (Model A): RealizedCap={self.capital:,.2f}, Calc'd UPL={unrealized_pnl:,.2f} -> "
-                                  f"EffCapBase={effective_capital_base:,.2f}, PeakCap={self.peak_capital:,.2f} -> ")
+            
+            details_log_header = (f"Pos Size Calc (Model A/C): SyncedTotalRealized={self.capital:,.2f}, SyncedTotalUPL={self.unrealized_pnl:,.2f} -> "
+                                  f"EffCapBase={effective_capital_base:,.2f}, SyncedTotalPeak={self.peak_capital:,.2f} -> ")
+
+
         else:
             effective_capital_base = self.capital + self.unrealized_pnl
             effective_capital = min(effective_capital_base, self.peak_capital)
@@ -360,10 +365,19 @@ class AdvancedAdaptiveGridTradingBot:
     def log_performance(self, print_log: bool = False, logger=None) -> dict:
         if logger is None: logger = default_logger
         
-        # Note: In Model C, self.capital is the *total portfolio's* realized cap.
-        pnl_cash = self.capital - self.initial_capital
-        total_return_pct = (pnl_cash / self.initial_capital) * 100 if self.initial_capital > 0 else 0
-        
+        is_backtest = self.connector.__class__.__name__ == 'DummyConnector'
+        is_model_c_run = is_backtest and (self.capital_allocation != 1.0)
+
+        if is_model_c_run:
+
+            pnl_cash = self.capital - self.portfolio_initial_capital
+            total_return_pct = (pnl_cash / self.portfolio_initial_capital) * 100 if self.portfolio_initial_capital > 0 else 0
+        else:
+
+            pnl_cash = self.capital - self.initial_capital
+            total_return_pct = (pnl_cash / self.initial_capital) * 100 if self.initial_capital > 0 else 0
+
+
         metrics = {"total_return_pct": total_return_pct, "pnl_cash": pnl_cash, "max_drawdown": self.max_drawdown, "sharpe_ratio": 0, "sortino_ratio": 0, "calmar_ratio": 0, "win_rate": 0, "profit_factor": 0, "total_trades": len(self.trade_history), "regime_performance": {},
                    "total_grids_built": self.total_grids_built,
                    "total_grids_traded": self.total_grids_traded,

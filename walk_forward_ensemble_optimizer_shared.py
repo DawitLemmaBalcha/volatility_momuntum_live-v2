@@ -91,10 +91,10 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             return
             
         opt_logger.info(f"Preparing {len(df_is)} IS records...")
-        df_is_prepared = prepare_data_for_simulation(df_is, config) # From backtest_runner_shared
+        df_is_prepared = prepare_data_for_simulation(df_is, config, opt_logger) # Pass logger
         
         opt_logger.info(f"Preparing {len(df_oos)} OOS records...")
-        df_oos_prepared = prepare_data_for_simulation(df_oos, config) # From backtest_runner_shared
+        df_oos_prepared = prepare_data_for_simulation(df_oos, config, opt_logger) # Pass logger
         
         if df_is_prepared.empty or df_oos_prepared.empty:
             opt_logger.warning("Skipping walk due to empty prepared data (IS or OOS).")
@@ -105,7 +105,6 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         return
 
     # 2. --- Run ONE Single, Wide Optimization (Model A) ---
-    # (This is correct - we are finding the best *individual* bots first)
     optuna.logging.set_verbosity(optuna.logging.ERROR)
     
     opt_logger.info(f"--- Running WIDE optimization ({n_trials} trials)... ---")
@@ -118,7 +117,6 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         n_jobs=-1, 
         show_progress_bar=True
     )
-
 
     # 3. --- Filter, Cluster, and Select Top Performers ---
     completed_trials = []
@@ -136,6 +134,9 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     if len(completed_trials) < n_clusters:
         opt_logger.warning(f"Found only {len(completed_trials)} trials, which is less than the desired cluster count of {n_clusters}. Using all found trials.")
         ensemble_bots_trials = completed_trials
+        # --- ADDED THIS ---
+        best_trials_from_clusters = pd.DataFrame([{'trial_object': t, 'cluster': 0, 'sortino': t.value} for t in completed_trials])
+        # --- END ADDED ---
     else:
         data_for_clustering = []
         for trial in completed_trials:
@@ -164,7 +165,6 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         opt_logger.error("No successful trials were selected. Cannot run OOS test.")
         return
 
-    # --- Enhanced Logging Block ---
     opt_logger.info(f"--- Selected {len(ensemble_bots_trials)} Trials for OOS Ensemble ---")
     for _, trial_row in best_trials_from_clusters.sort_values(by=['cluster', 'sortino'], ascending=[True, False]).iterrows():
         trial = trial_row['trial_object']
@@ -183,13 +183,11 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             f"PF={is_perf.get('profit_factor', 0):.2f}"
         )
         opt_logger.info(is_perf_str)
-    # --- End Logging Block ---
 
-    # 4. --- *** NEW: Run Out-of-Sample Ensemble Backtest (Model C) *** ---
+    # 4. --- Run Out-of-Sample Ensemble Backtest (Model C) ---
     opt_logger.info(f"--- Preparing {len(ensemble_bots_trials)} bots for (Model C) OOS ensemble... ---")
     ensemble_bots = []
     
-    # --- *** NEW: Calculate allocation per bot *** ---
     num_bots = len(ensemble_bots_trials)
     allocation_per_bot = 1.0 / num_bots
     opt_logger.info(f"Total capital will be shared. Each bot has a sizing allocation of {allocation_per_bot:.2%}")
@@ -206,19 +204,17 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         bot_config.ATR_TRAILING_STOP_MULTIPLIER = bot_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER * bot_config.TRAILING_RATIO
         
         bot = AdvancedAdaptiveGridTradingBot( # from trading_bot_shared
-            initial_capital=bot_config.INITIAL_CAPITAL, # Engine will override this
+            initial_capital=bot_config.INITIAL_CAPITAL,
             simulation_clock=None, 
             config_module=bot_config,
             connector=None, 
             silent=True
         )
         
-        # --- *** NEW: Set the bot's capital allocation *** ---
         bot.capital_allocation = allocation_per_bot
         
         ensemble_bots.append(bot)
 
-    # --- Run the SHARED (Model C) simulation ---
     opt_logger.info(f"--- Running OOS (Model C) ENSEMBLE backtest... ---")
     engine = SimulationEngine( # from backtest_runner_shared
         df_oos_prepared,
@@ -226,20 +222,35 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         opt_logger, 
         prepared=True
     )
-    portfolio_results, _ = engine.run()
-    # --- END NEW ---
     
-    if not portfolio_results:
+    # --- *** THIS IS THE FIX *** ---
+    # It was: portfolio_results, _ = engine.run()
+    portfolio_results, individual_results = engine.run()
+    # --- *** END FIX *** ---
+    
+    if not portfolio_results or not individual_results:
         opt_logger.error("Ensemble backtest failed to produce results.")
         return
         
     # 5. --- Log and Save Results ---
-    opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE (SHARED) | WALK #{walk_number} " + "="*25)
-    opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
-    opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
-    opt_logger.info(f"  Total Net PnL:             ${portfolio_results['pnl_cash']:,.2f}")
-    opt_logger.info(f"  Total Portfolio Return:    {portfolio_results['total_return_pct']:.2f}%")
-    opt_logger.info(f"  True Max Drawdown:         {portfolio_results['max_drawdown']:.2f}%")
+    opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE (Model C) | WALK #{walk_number} " + "="*25)
+    
+    full_log_str = individual_results[0].get("performance_log_str", None)
+    
+    if full_log_str:
+        log_lines = full_log_str.splitlines()
+        if len(log_lines) > 2:
+            for line in log_lines[1:-1]:
+                opt_logger.info(line)
+        else:
+            opt_logger.info(full_log_str)
+    else:
+        opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
+        opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
+        opt_logger.info(f"  Total Net PnL:             ${portfolio_results['pnl_cash']:,.2f}")
+        opt_logger.info(f"  Total Portfolio Return:    {portfolio_results['total_return_pct']:.2f}%")
+        opt_logger.info(f"  True Max Drawdown:         {portfolio_results['max_drawdown']:.2f}%")
+
     opt_logger.info("="*87 + "\n")
 
     portfolio_results['walk'] = walk_number
@@ -272,9 +283,9 @@ if __name__ == "__main__":
         {'is_start': '2025-05-01 00:00:00', 'is_end': '2025-08-01 00:00:00', 'oos_end': '2025-09-01 00:00:00'},
     ]
     
-    trials_per_optimization_walk = 200 
-    number_of_clusters = 4           
-    top_n_per_cluster = 3              
+    trials_per_optimization_walk = 20 
+    number_of_clusters = 2           
+    top_n_per_cluster = 1              
 
     main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (SHARED CAPITAL - MODEL C) ---")
     for i, walk_dates in enumerate(walk_forward_schedule):

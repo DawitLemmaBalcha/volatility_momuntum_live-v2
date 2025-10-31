@@ -106,6 +106,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             return
             
         # --- NEW: Prepare data ONCE for IS and OOS ---
+# --- NEW: Prepare data ONCE for IS and OOS ---
         opt_logger.info(f"Preparing {len(df_is)} IS records...")
         df_is_prepared = prepare_data_for_simulation(df_is, config)
         
@@ -128,19 +129,14 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     objective_func = create_wide_objective_function()
     study = optuna.create_study(direction="maximize")
     
-    # --- MODIFIED: Pass prepared IS data to objective ---
     study.optimize(
         lambda trial: objective_func(trial, df_is_prepared, opt_logger), # <-- Use df_is_prepared
         n_trials=n_trials, 
         n_jobs=-1, 
         show_progress_bar=True
     )
-    # --- END MODIFIED ---
 
-
-    # 3. --- NEW: Filter, Cluster, and Select Top Performers ---
-    
-    # 3a. Filter: Get all high-quality, completed trials
+    # 3. --- Filter, Cluster, and Select Top Performers ---
     completed_trials = []
     for t in study.trials:
         if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None:
@@ -148,7 +144,6 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             sortino = perf.get("sortino_ratio", -1.0)
             total_trades = perf.get("total_trades", 0)
             
-            # --- Quality Filter ---
             if sortino > 1 and total_trades > 20:
                 completed_trials.append(t)
 
@@ -157,45 +152,38 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     if len(completed_trials) < n_clusters:
         opt_logger.warning(f"Found only {len(completed_trials)} trials, which is less than the desired cluster count of {n_clusters}. Using all found trials.")
         ensemble_bots_trials = completed_trials
+        # --- ADDED THIS ---
+        best_trials_from_clusters = pd.DataFrame([{'trial_object': t, 'cluster': 0, 'sortino': t.value} for t in completed_trials])
+        # --- END ADDED ---
     else:
-        # 3b. Cluster: Prepare data and run K-Means
         data_for_clustering = []
         for trial in completed_trials:
             row = trial.params.copy()
             row['sortino'] = trial.value
-            row['trial_object'] = trial  # Keep a reference to the trial
+            row['trial_object'] = trial
             data_for_clustering.append(row)
         
         df = pd.DataFrame(data_for_clustering)
         param_cols = [col for col in df.columns if col not in ['sortino', 'trial_object']]
         
-        # Normalize parameters for stable clustering
         scaler = StandardScaler()
         df_scaled = scaler.fit_transform(df[param_cols])
 
-        # --- *** MODIFIED: Use n_clusters *** ---
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         df['cluster'] = kmeans.fit_predict(df_scaled)
         
         opt_logger.info(f"Clustering complete. Grouped trials into {n_clusters} clusters.")
 
-        # --- *** MODIFIED (Request 1): Select Top N from each cluster *** ---
-        # 3c. Select: Get the top N trials (by Sortino) from each cluster
         best_trials_from_clusters = df.groupby('cluster').apply(
             lambda x: x.nlargest(top_n_per_cluster, 'sortino')
         ).reset_index(drop=True)
         ensemble_bots_trials = best_trials_from_clusters['trial_object'].tolist()
-        # --- *** END MODIFICATION *** ---
     
-    # --- END NEW ---
-
     if not ensemble_bots_trials:
         opt_logger.error("No successful trials were selected. Cannot run OOS test.")
         return
 
-    # --- *** NEW (Request 2): Enhanced Logging Block *** ---
     opt_logger.info(f"--- Selected {len(ensemble_bots_trials)} Trials for OOS Ensemble ---")
-    # Sort by cluster then sortino for clean logging
     for _, trial_row in best_trials_from_clusters.sort_values(by=['cluster', 'sortino'], ascending=[True, False]).iterrows():
         trial = trial_row['trial_object']
         cluster = trial_row['cluster']
@@ -203,14 +191,10 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         
         opt_logger.info(f"  [Cluster {cluster}] - Trial {trial.number} | In-Sample Sortino: {sortino:.4f}")
         
-        # Log parameters
         params_to_log = trial.params.copy()
-        # Calculate the dependent param for clarity
         params_to_log['ATR_TRAILING_STOP_MULTIPLIER'] = params_to_log.get("ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER", 1.0) * params_to_log.get("TRAILING_RATIO", 0.5)
-        # Use indent=2 for slightly more compact logs
         opt_logger.info(f"    Params: {json.dumps(params_to_log, indent=2)}")
 
-        # Log full in-sample performance
         is_perf = trial.user_attrs.get("performance", {})
         is_perf_str = (
             f"    IS Perf: Return={is_perf.get('total_return_pct', 0):.2f}%, "
@@ -219,14 +203,11 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
             f"PF={is_perf.get('profit_factor', 0):.2f}"
         )
         opt_logger.info(is_perf_str)
-    # --- *** END NEW LOGGING BLOCK *** ---
-
 
     # 4. --- Run Out-of-Sample Ensemble Backtest ---
     opt_logger.info(f"--- Preparing {len(ensemble_bots_trials)} bots for OOS ensemble... ---")
     ensemble_bots = []
     
-    # Create bot configurations from selected trials
     for trial in ensemble_bots_trials:
         bot_config = ConfigContainer()
         for attr in dir(config):
@@ -240,40 +221,57 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         
         bot = AdvancedAdaptiveGridTradingBot(
             initial_capital=bot_config.INITIAL_CAPITAL, 
-            simulation_clock=None, # Engine will provide this
+            simulation_clock=None,
             config_module=bot_config,
-            connector=None, # Engine will provide this
+            connector=None,
             silent=True
         )
         ensemble_bots.append(bot)
 
-    # --- MODIFIED: Run the concurrent simulation using PREPARED OOS data ---
     opt_logger.info(f"--- Running OOS ENSEMBLE backtest with {len(ensemble_bots)} bots... ---")
     engine = SimulationEngine(
-        df_oos_prepared,  # <-- Pass prepared OOS data
+        df_oos_prepared,
         ensemble_bots, 
         opt_logger, 
-        prepared=True     # <-- Set prepared flag to True
+        prepared=True
     )
-    portfolio_results, _ = engine.run()
-    # --- END MODIFIED ---
     
-    if not portfolio_results:
+    # --- *** THIS IS THE FIX *** ---
+    # It was: portfolio_results, _ = engine.run()
+    portfolio_results, individual_results = engine.run()
+    # --- *** END FIX *** ---
+    
+    if not portfolio_results or not individual_results:
         opt_logger.error("Ensemble backtest failed to produce results.")
         return
         
-    # 5. --- Log and Save Results --- (No changes here)
-    opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE | WALK #{walk_number} " + "="*25)
+    # 5. --- Log and Save Results ---
+    opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE (Model A) | WALK #{walk_number} " + "="*25)
+    opt_logger.info(f"  --- Portfolio Summary (Sum of all bots) ---")
     opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
     opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
     opt_logger.info(f"  Total Net PnL:             ${portfolio_results['pnl_cash']:,.2f}")
     opt_logger.info(f"  Total Portfolio Return:    {portfolio_results['total_return_pct']:.2f}%")
-    opt_logger.info(f"  True Max Drawdown:         {portfolio_results['max_drawdown']:.2f}%")
+    opt_logger.info(f"  Portfolio Max Drawdown:    {portfolio_results['max_drawdown']:.2f}% (Note: This is an approximation of combined equity)")
+    
+    opt_logger.info(f"\n  --- Individual Bot Performance (Model A) ---")
+    for i, bot_metrics in enumerate(individual_results):
+        bot_id_str = f"Bot {i+1} (Trial {ensemble_bots_trials[i].number})"
+        opt_logger.info(f"\n--- Stats for {bot_id_str} ---")
+        
+        log_str = bot_metrics.get("performance_log_str", "Performance log not available.")
+        
+        log_lines = log_str.splitlines()
+        if len(log_lines) > 2:
+            for line in log_lines[1:-1]:
+                opt_logger.info(line)
+        else:
+            opt_logger.info(log_str)
+    
     opt_logger.info("="*87 + "\n")
 
     portfolio_results['walk'] = walk_number
     all_walks_data.append(portfolio_results)
-# --- END MODIFIED ---
 
 
 if __name__ == "__main__":
@@ -304,11 +302,11 @@ if __name__ == "__main__":
     
     # --- *** MODIFIED: Renamed and Added new variable *** ---
     # We run ONE study per walk, so n_trials should be high.
-    trials_per_optimization_walk = 200 # <-- Run a large number of trials
-    number_of_clusters = 4           # <-- How many clusters to create
+    trials_per_optimization_walk = 20 # <-- Run a large number of trials
+    number_of_clusters = 2           # <-- How many clusters to create
     
     # --- THIS IS THE VARIABLE FOR REQUEST 1 ---
-    top_n_per_cluster = 3              # <-- How many top bots to select from EACH cluster
+    top_n_per_cluster = 1              # <-- How many top bots to select from EACH cluster
     # --- END MODIFICATION ---
 
     main_logger.info("--- Starting Full Walk-Forward Ensemble Analysis (with K-Means Clustering) ---")

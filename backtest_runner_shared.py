@@ -27,7 +27,6 @@ class SimulationEngine:
         self.bots = bots
         self.logger = logger or logging.getLogger(__name__)
         
-        # --- *** NEW: Master Portfolio State *** ---
         if not self.bots:
             raise ValueError("SimulationEngine requires at least one bot.")
         
@@ -37,12 +36,16 @@ class SimulationEngine:
         
         self.portfolio_equity_curve = [self.initial_portfolio_capital]
         
-        # --- *** NEW (Request 2): Realized Portfolio Tracking *** ---
         self.realized_portfolio_equity_curve = [self.initial_portfolio_capital]
-        # --- *** END NEW *** ---
+        
+        # --- *** FIX 1 of 4: Add a master variable for realized capital *** ---
+        # This is the single source of truth for the portfolio's REALIZED capital.
+        # It is only updated by the P&L from the DummyConnector.
+        self.master_realized_capital = self.initial_portfolio_capital
+        # --- *** END FIX *** ---
 
     def _prepare_data(self):
-        # ... (no changes in this function) ...
+        # ... (This function is correct, no changes) ...
         
         if self.is_prepared:
             return self.data 
@@ -89,7 +92,7 @@ class SimulationEngine:
         df_1m['rsi_1m'] = ta.rsi(df_1m['close'], length=bot_config.CONFIRMATION_RSI_PERIOD).shift(1)
         df_1m['volume_ma_1m'] = df_1m['volume'].rolling(window=bot_config.CONFIRMATION_VOLUME_MA_PERIOD).mean().shift(1)
         macd_1m = ta.macd(df_1m['close'], fast=bot_config.CONFIRMATION_MACD_FAST_PERIOD, slow=bot_config.CONFIRMATION_MACD_SLOW_PERIOD, signal=bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD)
-        df_1m['macd_1m'] = macd_1m[f'MACD_{bot_config.CONFIRMATION_MACD_FAST_PERIOD}_{bot_config.CONFIRMATION_MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}'].shift(1)
+        df_1m['macd_1m'] = macd_1m[f'MACD_{bot_config.CONFIRMATION_MACD_FAST_PERIOD}_{bot_config.CONFIRMATION_MACD_SLOW_PERIOD}_{bot_config.CONFIRMATION_MACD_SIGNAL_PERIOD}'].shift(1)
         
         indicator_cols = ['timestamp', 'short_ema', 'long_ema', 'rsi', 'atr', 'macd', 'bb_lower', 'bb_upper']
         for col in indicator_cols:
@@ -114,19 +117,30 @@ class SimulationEngine:
 
         sim_start_time = df_merged['timestamp'].iloc[0].timestamp()
         clock = SimulationClock(start_time=sim_start_time)
-        dummy_connector = DummyConnector(clock, {})
+        
+        # --- *** FIX 2 of 4: Pass the engine instance 'self' to the connector *** ---
+        # This allows the connector to update the engine's master capital.
+        dummy_connector = DummyConnector(clock, {}, engine=self)
 
         first_row = df_merged.iloc[0]
-        # Set clock to first row *before* bot init
         clock.current_time = first_row['timestamp'].timestamp()
         clock.current_price = first_row['close']
         
+
         for bot in self.bots:
-            bot.initial_capital = self.initial_per_bot_capital
-            bot.capital = self.initial_per_bot_capital # This is the bot's *realized* stake
-            bot.peak_capital = self.initial_per_bot_capital 
+            # This is the bot's own initial capital (e.g., $100,000)
+            bot.initial_capital = self.initial_per_bot_capital 
+            
+            # --- ADD THIS LINE ---
+            # This is the portfolio's initial capital (e.g., $200,000)
+            bot.portfolio_initial_capital = self.initial_portfolio_capital
+            # --- END ADD ---
+            
+            bot.capital = self.master_realized_capital 
+            bot.peak_capital = self.master_peak_capital 
             
             bot.realized_equity_curve = [self.initial_portfolio_capital]
+            # ... (rest of the bot setup) ...
             
             bot.clock = clock
             bot.connector = dummy_connector
@@ -140,12 +154,13 @@ class SimulationEngine:
         for i in range(1, len(df_merged)):
             current_row, prev_row = df_merged.iloc[i], df_merged.iloc[i-1]
             
-            # --- *** THIS IS THE FIX: SYNC AT THE START OF THE LOOP *** ---
-            # --- *** MASTER PORTFOLIO SYNC (Model C) *** ---
+            # --- *** FIX 3 of 4: Modify the SYNC BLOCK *** ---
             
             # 1. Calculate GLOBAL portfolio state
-            # Uses clock.current_price (which is *prev_row's* close) for UPL
-            total_realized_capital = sum(bot.capital for bot in self.bots)
+            # --- THIS IS THE FIX ---
+            # DO NOT sum bot.capital. Use the master variable.
+            # The DummyConnector will update self.master_realized_capital directly.
+            total_realized_capital = self.master_realized_capital 
             
             total_unrealized_pnl = 0.0
             for bot in self.bots:
@@ -156,7 +171,6 @@ class SimulationEngine:
             
             # 2. Update GLOBAL equity peak
             self.master_peak_capital = max(self.master_peak_capital, current_total_equity)
-            
             self.realized_portfolio_equity_curve.append(total_realized_capital)
 
             # 3. Inject GLOBAL state into ALL bots
@@ -165,10 +179,10 @@ class SimulationEngine:
                 bot.unrealized_pnl = total_unrealized_pnl   
                 bot.peak_capital = self.master_peak_capital 
                 bot.realized_equity_curve = self.realized_portfolio_equity_curve
-            # --- *** END SYNC BLOCK *** ---
+            # --- *** END FIX *** ---
             
             
-            # Update 30-minute strategies (now uses the fresh state)
+            # Update 30-minute strategies
             if current_row['timestamp'].floor('30min') > prev_row['timestamp'].floor('30min'):
                 for bot in self.bots:
                     bot.update_strategy_on_30m(prev_row.to_dict())
@@ -189,13 +203,15 @@ class SimulationEngine:
                 clock.current_time, clock.current_price = tick.timestamp, price
                 
                 for bot in self.bots:
-                    # check_entries uses the state we just injected
                     bot.check_entries_on_tick(tick, rsi_1m_val, macd_1m_val, volume_1m_val, volume_ma_1m_val, atr_val)
+                    
+                    # --- *** FIX 4 of 4: Call check_exits_on_1m *** ---
+                    # This function will call bot.close_position, which calls
+                    # the connector, which now updates self.master_realized_capital.
+                    # This completes the loop, and P&L is now correctly added.
                     bot.check_exits_on_1m(price, atr_val)
 
-            # --- *** MASTER PORTFOLIO SYNC BLOCK WAS MOVED FROM HERE *** ---
-
-            # Record portfolio equity at the end of each 1m candle
+            
             self.portfolio_equity_curve.append(current_total_equity)
             
             if trial and i % 1000 == 0:
@@ -220,7 +236,7 @@ class SimulationEngine:
         return portfolio_results, individual_results
 
     def _calculate_portfolio_metrics(self):
-        # ... (no changes in this function) ...
+        # ... (This function is correct, no changes) ...
         equity_series = pd.Series(self.portfolio_equity_curve)
         peak = equity_series.expanding().max()
         drawdown = (equity_series - peak) / peak
@@ -239,8 +255,12 @@ class SimulationEngine:
         }
 
 # --- Wrapper functions (prepare_data, run_from_prepared, run_single) ---
-# ... (no changes needed in these wrapper functions) ...
-def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module) -> pd.DataFrame:
+
+# --- *** FIX FOR NameError: 'bot' is not defined *** ---
+def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module, logger=None) -> pd.DataFrame:
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
     dummy_bot = AdvancedAdaptiveGridTradingBot( 
         initial_capital=0,
         simulation_clock=SimulationClock(0),
@@ -248,12 +268,14 @@ def prepare_data_for_simulation(df_1m_full: pd.DataFrame, config_module) -> pd.D
         connector=None,
         silent=True
     )
-    temp_engine = SimulationEngine(df_1m_full, [dummy_bot], prepared=False)
+    # --- THIS WAS THE BUG: It said [bot] instead of [dummy_bot] ---
+    temp_engine = SimulationEngine(df_1m_full, [dummy_bot], logger, prepared=False) 
+    # --- END BUG FIX ---
     try:
         df_prepared = temp_engine._prepare_data()
         return df_prepared
     except Exception as e:
-        logging.getLogger(__name__).error(f"Failed during data preparation: {e}", exc_info=True)
+        logger.error(f"Failed during data preparation: {e}", exc_info=True)
         return pd.DataFrame() 
 
 def run_simulation_from_prepared_data(
@@ -265,16 +287,22 @@ def run_simulation_from_prepared_data(
 ):
     bot_config = config_module
     fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
-    dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
+    
+    # We create a single bot for the optimization's objective function
     bot = AdvancedAdaptiveGridTradingBot( 
         initial_capital=bot_config.INITIAL_CAPITAL,
         simulation_clock=SimulationClock(0), 
         config_module=bot_config,
-        connector=dummy_connector,
+        connector=None, # Connector will be set by the engine
         silent=not verbose
     )
+    
+    # We pass the bot in a list to the engine
     engine = SimulationEngine(df_prepared, [bot], logger, prepared=True)
+    
+    # The engine will create the connector and pass 'self' (the engine) to it
     portfolio_results, individual_results = engine.run(trial=trial)
+    
     final_metrics = individual_results[0] if individual_results else {}
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))
@@ -291,17 +319,18 @@ def run_single_backtest(
     trial: Optional[optuna.trial.Trial] = None 
 ):
     bot_config = config_module
-    fee = getattr(bot_config, 'BYBIT_TAKER_FEE', 0.00055)
-    dummy_connector = DummyConnector(SimulationClock(0), { "BYBIT_TAKER_FEE": fee })
+    
     bot = AdvancedAdaptiveGridTradingBot( 
         initial_capital=bot_config.INITIAL_CAPITAL,
         simulation_clock=SimulationClock(0), 
         config_module=bot_config,
-        connector=dummy_connector,
+        connector=None, # Connector will be set by the engine
         silent=not verbose
     )
+    
     engine = SimulationEngine(df_1m_full, [bot], logger, prepared=False)
     portfolio_results, individual_results = engine.run(trial=trial)
+    
     final_metrics = individual_results[0] if individual_results else {}
     if verbose and logger and final_metrics:
         logger.info(final_metrics.get("performance_log_str", "Performance log not available."))
