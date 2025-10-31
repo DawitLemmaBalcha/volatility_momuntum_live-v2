@@ -23,6 +23,16 @@ from backtest_runner_shared import (
 )
 # --- *** END NEW *** ---
 
+# --- *** ADDED FOR MODEL A DIAGNOSTICS *** ---
+# Import the Model A (distinct capital) runner for our diagnostic OOS tests
+try:
+    from backtest_runner import run_simulation_from_prepared_data as run_model_a_simulation
+except ImportError:
+    print("Could not import Model A backtest_runner. Diagnostics will fail.")
+    run_model_a_simulation = None
+# --- *** END ADDED *** ---
+
+
 all_walks_data = []
 
 def create_wide_objective_function():
@@ -192,6 +202,7 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
     allocation_per_bot = 1.0 / num_bots
     opt_logger.info(f"Total capital will be shared. Each bot has a sizing allocation of {allocation_per_bot:.2%}")
     
+    # --- *** MODIFICATION: This list is now ONLY for the Model C test *** ---
     for trial in ensemble_bots_trials:
         bot_config = ConfigContainer()
         for attr in dir(config):
@@ -223,36 +234,62 @@ def run_ensemble_walk(walk_number: int, is_start: str, is_end: str, oos_end: str
         prepared=True
     )
     
-    # --- *** THIS IS THE FIX *** ---
-    # It was: portfolio_results, _ = engine.run()
-    portfolio_results, individual_results = engine.run()
-    # --- *** END FIX *** ---
+    # --- This result is for the Model C (Shared Capital) run ---
+    portfolio_results, _ = engine.run() # We don't need individual_results from this run
     
-    if not portfolio_results or not individual_results:
-        opt_logger.error("Ensemble backtest failed to produce results.")
+    if not portfolio_results:
+        opt_logger.error("Ensemble (Model C) backtest failed to produce results.")
         return
         
-    # 5. --- Log and Save Results ---
+    # 5. --- Log and Save Results (NEW HYBRID MODEL) ---
     opt_logger.info("\n" + "="*25 + f" OOS ENSEMBLE PERFORMANCE (Model C) | WALK #{walk_number} " + "="*25)
     
-    full_log_str = individual_results[0].get("performance_log_str", None)
+    # --- LOG 1: The Model C (Shared Capital) Portfolio Summary ---
+    opt_logger.info(f"  --- Portfolio Summary (Shared Capital) ---")
+    opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
+    opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
+    opt_logger.info(f"  Total Net PnL:             ${portfolio_results['pnl_cash']:,.2f}")
+    opt_logger.info(f"  Total Portfolio Return:    {portfolio_results['total_return_pct']:.2f}%")
+    opt_logger.info(f"  Portfolio Max Drawdown:    {portfolio_results['max_drawdown']:.2f}% (Equity Drawdown)")
+
+    # --- LOG 2: The Model A (Distinct Capital) Individual Diagnostics ---
+    opt_logger.info(f"\n  --- Individual Bot Performance (Model A Diagnostics) ---")
     
-    if full_log_str:
-        log_lines = full_log_str.splitlines()
-        if len(log_lines) > 2:
-            for line in log_lines[1:-1]:
-                opt_logger.info(line)
-        else:
-            opt_logger.info(full_log_str)
+    if run_model_a_simulation is None:
+        opt_logger.error("  CANNOT RUN DIAGNOSTICS: Failed to import 'run_model_a_simulation' from 'backtest_runner.py'.")
     else:
-        opt_logger.info(f"  Initial Portfolio Capital: ${portfolio_results['initial_capital']:,.2f}")
-        opt_logger.info(f"  Final Portfolio Capital:   ${portfolio_results['final_capital']:,.2f}")
-        opt_logger.info(f"  Total Net PnL:             ${portfolio_results['pnl_cash']:,.2f}")
-        opt_logger.info(f"  Total Portfolio Return:    {portfolio_results['total_return_pct']:.2f}%")
-        opt_logger.info(f"  True Max Drawdown:         {portfolio_results['max_drawdown']:.2f}%")
+        opt_logger.info(f"  Running {len(ensemble_bots_trials)} additional Model A backtests for diagnostics...")
+        
+        for i, trial in enumerate(ensemble_bots_trials):
+            opt_logger.info(f"\n--- Stats for Bot {i+1} (Trial {trial.number}) ---")
+            
+            # 1. Create the config for this specific bot
+            bot_config = ConfigContainer()
+            for attr in dir(config):
+                if attr.isupper():
+                    setattr(bot_config, attr, getattr(config, attr))
+            for key, value in trial.params.items():
+                setattr(bot_config, key, value)
+            bot_config.ATR_TRAILING_STOP_MULTIPLIER = bot_config.ATR_TRAILING_STOP_ACTIVATION_MULTIPLIER * bot_config.TRAILING_RATIO
+            
+            # 2. Run a new Model A (distinct capital) backtest
+            model_a_metrics = run_model_a_simulation(
+                df_oos_prepared,
+                bot_config,
+                verbose=False, # We get the log string, no need for the runner to log it
+                logger=opt_logger
+            )
+            
+            # 3. Print the full performance log from the Model A run
+            if model_a_metrics:
+                log_str = model_a_metrics.get("performance_log_str", "Performance log not available.")
+                opt_logger.info(log_str)
+            else:
+                opt_logger.info("  Model A diagnostic backtest failed for this bot.")
 
     opt_logger.info("="*87 + "\n")
 
+    # Save the main Model C portfolio results
     portfolio_results['walk'] = walk_number
     all_walks_data.append(portfolio_results)
 
