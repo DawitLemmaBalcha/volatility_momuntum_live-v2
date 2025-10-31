@@ -19,7 +19,7 @@ from simulation.backtest_runner_shared import run_single_backtest
 
 def setup_logging():
     """Configures logging for a shared backtest run."""
-    log_filename = f"backtest_SHARED_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    log_filename = f"logs/backtest_SHARED_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     for handler in logger.handlers[:]:
