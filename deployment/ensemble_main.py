@@ -1,14 +1,22 @@
 # ensemble_main.py
-import importlib.util
 import sys
+import os
+
+# Add the project root directory to the Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import importlib.util
 import time
 import logging
-import os
 import threading
 import pandas as pd
 import pandas_ta as ta
 from collections import deque
 from dotenv import load_dotenv
+dotenv_path = os.path.join(project_root, 'api.env')
+load_dotenv(dotenv_path=dotenv_path)
 from typing import List, Dict, Callable
 
 from deployment.ensemble_config import VENUES

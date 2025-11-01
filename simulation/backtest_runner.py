@@ -49,9 +49,7 @@ class SimulationEngine:
         df_30m['macd'] = macd_30m[f'MACD_{bot_config.MACD_FAST_PERIOD}_{bot_config.MACD_SLOW_PERIOD}_{bot_config.MACD_SIGNAL_PERIOD}']
 
         bb_period = bot_config.BOLLINGER_PERIOD
-        # --- *** THIS IS THE FIX *** ---
-        bb_std = bot_config.BOLLINGER_STD_DEV # (Was BOLLINGZ_STD_DEV)
-        # --- *** END FIX *** ---
+        bb_std = bot_config.BOLLINGER_STD_DEV
         
         bbands_30m = ta.bbands(df_30m['close'], length=bb_period, std=bb_std)
 
